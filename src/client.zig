@@ -188,6 +188,24 @@ pub const Client = struct {
         return parsed.tags;
     }
 
+    /// Lists the repositories of `image`'s registry (registry-scoped, no
+    /// repository segment in the URL). `n` limits the result and `last`
+    /// resumes after a repository (pagination: the caller passes the last
+    /// returned repository back as `last` on the next call; the response
+    /// carries no pagination fields). Two-level ownership: the returned slice
+    /// and each repository string are separate allocations from the Client's
+    /// allocator — free the slice, then each repo string.
+    pub fn catalog(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, n: ?usize, last: ?[]const u8) ![]const []const u8 {
+        const url = try catalogUrl(self.allocator, self.config, image, n, last);
+        defer self.allocator.free(url);
+        const uri = try std.Uri.parse(url);
+        var result = try self.getBody(io, image, creds, .pull, uri, &.{});
+        defer result.deinit(self.allocator);
+        const Catalog = struct { repositories: []const []const u8 };
+        const parsed = try std.json.parseFromSliceLeaky(Catalog, self.allocator, result.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        return parsed.repositories;
+    }
+
     /// Fetches the `Docker-Content-Digest` header of `image`'s manifest.
     /// Returns the digest string (allocated). Errors with `InvalidResponse`
     /// when the header is absent.
@@ -206,6 +224,58 @@ pub const Client = struct {
         result.digest_header = null;
         result.deinit(self.allocator);
         return d;
+    }
+
+    /// Checks whether the blob `digest_str` exists in `image`'s repository
+    /// (HEAD on the blob URL). Returns false when the blob is absent (404);
+    /// any other failure is an error.
+    pub fn blobExists(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, digest_str: []const u8) !bool {
+        const path = try std.fmt.allocPrint(self.allocator, "blobs/{s}", .{digest_str});
+        defer self.allocator.free(path);
+        const url = try buildUrl(self.allocator, self.config, image, path, null);
+        defer self.allocator.free(url);
+        const uri = try std.Uri.parse(url);
+        return self.headRequest(io, image, creds, .pull, uri);
+    }
+
+    /// HEAD with auth (cache -> caller auth -> 401 token flow + one retry).
+    /// Returns true on success, false on 404. `.forbidden` -> error.Forbidden,
+    /// other non-success statuses -> error.UnexpectedStatus. No body is read.
+    fn headRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation, uri: std.Uri) !bool {
+        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        defer http.deinit();
+        var redirect_buf: [8192]u8 = undefined;
+
+        var attempts: usize = 0;
+        while (attempts < 2) : (attempts += 1) {
+            const auth_value = try self.authorizationHeader(io, image, creds, op);
+            defer if (auth_value) |v| self.allocator.free(v);
+
+            var req = try http.request(.HEAD, uri, .{
+                .redirect_behavior = .unhandled,
+                .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
+            });
+            defer req.deinit();
+            try req.sendBodiless();
+            const resp = try req.receiveHead(&redirect_buf);
+            const status = resp.head.status;
+
+            if (status == .unauthorized and attempts == 0) {
+                const token = try self.auth(io, image, creds, op);
+                if (token) |t| self.allocator.free(t);
+                continue;
+            }
+
+            switch (status) {
+                .not_found => return false,
+                .forbidden => return error.Forbidden,
+                else => {
+                    if (status.class() != .success) return error.UnexpectedStatus;
+                    return true;
+                },
+            }
+        }
+        return error.Unauthorized;
     }
 
     /// Pulls `image`'s manifest and its digest. The digest comes from the
@@ -1053,6 +1123,33 @@ fn buildUrl(allocator: Allocator, config: ClientConfig, image: reference.Referen
     return std.fmt.allocPrint(allocator, "{s}://{s}/v2/{s}/{s}", .{ scheme, image.registry, image.repository, path });
 }
 
+/// Builds "<scheme>://<registry>/v2/_catalog[?n=<n>[&last=<encoded>]]" —
+/// registry-scoped, no repository segment. `n` and `last` are appended only
+/// when present.
+fn catalogUrl(allocator: Allocator, config: ClientConfig, image: reference.Reference, n: ?usize, last: ?[]const u8) ![]u8 {
+    const scheme = config.scheme(image.registry);
+    var q = std.ArrayList(u8).empty;
+    defer q.deinit(allocator);
+    var first = true;
+    if (n) |count| {
+        const ns = try std.fmt.allocPrint(allocator, "n={d}", .{count});
+        defer allocator.free(ns);
+        try q.appendSlice(allocator, ns);
+        first = false;
+    }
+    if (last) |l| {
+        if (!first) try q.append(allocator, '&');
+        try q.appendSlice(allocator, "last=");
+        const enc = try percentEncode(allocator, l);
+        defer allocator.free(enc);
+        try q.appendSlice(allocator, enc);
+    }
+    if (q.items.len > 0) {
+        return std.fmt.allocPrint(allocator, "{s}://{s}/v2/_catalog?{s}", .{ scheme, image.registry, q.items });
+    }
+    return std.fmt.allocPrint(allocator, "{s}://{s}/v2/_catalog", .{ scheme, image.registry });
+}
+
 /// Parses the `/total` of a `Content-Range: bytes <start>-<end>/<total>` header.
 fn contentRangeTotal(head: std.http.Client.Response.Head) ?u64 {
     var it = head.iterateHeaders();
@@ -1270,6 +1367,41 @@ test "buildUrl" {
     const url3 = try buildUrl(a, http_cfg, image, "blobs/sha256:abc", null);
     defer a.free(url3);
     try std.testing.expectEqualStrings("http://registry.example.com/v2/foo/bar/blobs/sha256:abc", url3);
+}
+
+test "catalogUrl query params" {
+    const a = std.testing.allocator;
+    const cfg = ClientConfig{ .protocol = .https };
+    const image = try reference.parse("registry.example.com/foo/bar:v1");
+
+    const both = try catalogUrl(a, cfg, image, 10, "zot%repo");
+    defer a.free(both);
+    try std.testing.expectEqualStrings("https://registry.example.com/v2/_catalog?n=10&last=zot%25repo", both);
+
+    const only_n = try catalogUrl(a, cfg, image, 5, null);
+    defer a.free(only_n);
+    try std.testing.expectEqualStrings("https://registry.example.com/v2/_catalog?n=5", only_n);
+
+    const only_last = try catalogUrl(a, cfg, image, null, "abc");
+    defer a.free(only_last);
+    try std.testing.expectEqualStrings("https://registry.example.com/v2/_catalog?last=abc", only_last);
+
+    const none = try catalogUrl(a, cfg, image, null, null);
+    defer a.free(none);
+    try std.testing.expectEqualStrings("https://registry.example.com/v2/_catalog", none);
+}
+
+test "catalogUrl is registry-scoped with no repository segment" {
+    const a = std.testing.allocator;
+    const image = try reference.parse("registry.example.com/team/proj/image:v1");
+    // The reference's repository (team/proj/image) and tag must not appear.
+    const url = try catalogUrl(a, ClientConfig{ .protocol = .https }, image, null, null);
+    defer a.free(url);
+    try std.testing.expectEqualStrings("https://registry.example.com/v2/_catalog", url);
+
+    const url2 = try catalogUrl(a, ClientConfig{ .protocol = .http }, image, null, null);
+    defer a.free(url2);
+    try std.testing.expectEqualStrings("http://registry.example.com/v2/_catalog", url2);
 }
 
 test "linux and windows resolvers pick first matching platform" {
