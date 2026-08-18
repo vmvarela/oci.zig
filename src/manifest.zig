@@ -111,14 +111,22 @@ pub const OciPlatform = struct {
         try jws.write(self.architecture);
         try jws.objectField("os");
         try jws.write(self.os);
-        try jws.objectField("osVersion");
-        try jws.write(self.os_version);
-        try jws.objectField("osFeatures");
-        try jws.write(self.os_features);
-        try jws.objectField("variant");
-        try jws.write(self.variant);
-        try jws.objectField("features");
-        try jws.write(self.features);
+        if (self.os_version) |v| {
+            try jws.objectField("osVersion");
+            try jws.write(v);
+        }
+        if (self.os_features) |v| {
+            try jws.objectField("osFeatures");
+            try jws.write(v);
+        }
+        if (self.variant) |v| {
+            try jws.objectField("variant");
+            try jws.write(v);
+        }
+        if (self.features) |v| {
+            try jws.objectField("features");
+            try jws.write(v);
+        }
         try jws.endObject();
     }
 };
@@ -142,14 +150,22 @@ pub const OciDescriptor = struct {
         try jws.write(self.digest);
         try jws.objectField("size");
         try jws.write(self.size);
-        try jws.objectField("urls");
-        try jws.write(self.urls);
-        try jws.objectField("annotations");
-        try jws.write(self.annotations);
-        try jws.objectField("platform");
-        try jws.write(self.platform);
-        try jws.objectField("artifactType");
-        try jws.write(self.artifact_type);
+        if (self.urls) |v| {
+            try jws.objectField("urls");
+            try jws.write(v);
+        }
+        if (self.annotations) |v| {
+            try jws.objectField("annotations");
+            try jws.write(v);
+        }
+        if (self.platform) |v| {
+            try jws.objectField("platform");
+            try jws.write(v);
+        }
+        if (self.artifact_type) |v| {
+            try jws.objectField("artifactType");
+            try jws.write(v);
+        }
         try jws.endObject();
     }
 };
@@ -169,18 +185,28 @@ pub const OciImageManifest = struct {
         try jws.beginObject();
         try jws.objectField("schemaVersion");
         try jws.write(self.schema_version);
-        try jws.objectField("mediaType");
-        try jws.write(self.media_type);
-        try jws.objectField("artifactType");
-        try jws.write(self.artifact_type);
-        try jws.objectField("config");
-        try jws.write(self.config);
+        if (self.media_type) |v| {
+            try jws.objectField("mediaType");
+            try jws.write(v);
+        }
+        if (self.artifact_type) |v| {
+            try jws.objectField("artifactType");
+            try jws.write(v);
+        }
+        if (self.config) |v| {
+            try jws.objectField("config");
+            try jws.write(v);
+        }
         try jws.objectField("layers");
         try jws.write(self.layers);
-        try jws.objectField("subject");
-        try jws.write(self.subject);
-        try jws.objectField("annotations");
-        try jws.write(self.annotations);
+        if (self.subject) |v| {
+            try jws.objectField("subject");
+            try jws.write(v);
+        }
+        if (self.annotations) |v| {
+            try jws.objectField("annotations");
+            try jws.write(v);
+        }
         try jws.endObject();
     }
 };
@@ -198,16 +224,24 @@ pub const OciImageIndex = struct {
         try jws.beginObject();
         try jws.objectField("schemaVersion");
         try jws.write(self.schema_version);
-        try jws.objectField("mediaType");
-        try jws.write(self.media_type);
-        try jws.objectField("artifactType");
-        try jws.write(self.artifact_type);
+        if (self.media_type) |v| {
+            try jws.objectField("mediaType");
+            try jws.write(v);
+        }
+        if (self.artifact_type) |v| {
+            try jws.objectField("artifactType");
+            try jws.write(v);
+        }
         try jws.objectField("manifests");
         try jws.write(self.manifests);
-        try jws.objectField("subject");
-        try jws.write(self.subject);
-        try jws.objectField("annotations");
-        try jws.write(self.annotations);
+        if (self.subject) |v| {
+            try jws.objectField("subject");
+            try jws.write(v);
+        }
+        if (self.annotations) |v| {
+            try jws.objectField("annotations");
+            try jws.write(v);
+        }
         try jws.endObject();
     }
 };

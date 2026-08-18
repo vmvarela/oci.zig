@@ -437,8 +437,9 @@ pub const Client = struct {
 
         var start: u64 = 0;
         if (size > 0) {
+            var r = reader; // methods need *Reader (mutable)
             while (true) {
-                const n = try reader.readSliceShort(buf);
+                const n = try r.readSliceShort(buf);
                 if (n == 0) break;
                 hasher.update(buf[0..n]);
                 const end = start + n - 1;
@@ -547,10 +548,13 @@ pub const Client = struct {
         }
         if (config == null) return error.InvalidResponse;
 
-        // Layers first, then config, then manifest.
+        // Layers first, then config, then manifest. Single owner: one defer
+        // (registered before the loop) frees only the filled entries [0..pushed]
+        // and the backing array — on mid-loop error, post-loop error, and
+        // success alike, exactly once each.
         const layer_digests = try self.allocator.alloc([]const u8, layers.len);
         var pushed: usize = 0;
-        errdefer {
+        defer {
             for (layer_digests[0..pushed]) |d| self.allocator.free(d);
             self.allocator.free(layer_digests);
         }
@@ -558,7 +562,6 @@ pub const Client = struct {
             layer_digests[i] = try self.pushBlob(io, image, creds, l);
             pushed += 1;
         }
-        defer for (layer_digests) |d| self.allocator.free(d);
 
         const config_digest = try self.pushBlob(io, image, creds, config.?);
         defer self.allocator.free(config_digest);
@@ -793,26 +796,30 @@ pub const Client = struct {
     /// caller creds); on 401, parses the Bearer challenge from the FAILED
     /// response, fetches a token with scope "repository:{repo}:pull,push",
     /// caches it under (registry, repo, .push), and retries once. Anonymous
-    /// creds never retry. Returns the request + response; the caller keeps
-    /// `req` alive while consuming `resp`, then calls `req.deinit()`.
+    /// creds never retry. The container (http client + req) outlives the
+    /// function; the caller keeps `resp` alive, then calls req.deinit() +
+    /// client.deinit() + destroy (see WriteHttp).
     fn writeRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, extra_headers: []const std.http.Header, body: []u8) !WriteAttempt {
-        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
-        defer http.deinit();
-        var redirect_buf: [8192]u8 = undefined;
+        const container = try self.allocator.create(WriteHttp);
+        container.* = .{ .client = .{ .allocator = self.allocator, .io = io }, .req = undefined };
+        errdefer {
+            container.client.deinit();
+            self.allocator.destroy(container);
+        }
 
         var attempts: usize = 0;
         while (attempts < 2) : (attempts += 1) {
             const auth_value = try self.authorizationHeader(io, image, creds, .push);
             defer if (auth_value) |v| self.allocator.free(v);
 
-            var req = try http.request(method, uri, .{
+            container.req = try container.client.request(method, uri, .{
                 .redirect_behavior = .unhandled,
                 .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
                 .extra_headers = extra_headers,
             });
-            errdefer req.deinit();
-            try req.sendBodyComplete(body);
-            var resp = try req.receiveHead(&redirect_buf);
+            errdefer container.req.deinit();
+            try container.req.sendBodyComplete(body);
+            var resp = try container.req.receiveHead(&container.redirect_buf);
             const status = resp.head.status;
 
             if (status == .unauthorized and attempts == 0 and creds != .anonymous) {
@@ -826,7 +833,9 @@ pub const Client = struct {
                         break;
                     }
                 }
-                req.deinit();
+                // ALL fallible work happens before the explicit req.deinit();
+                // any error here returns through the errdefer path, which
+                // deinits the (still live) req exactly once.
                 defer if (challenge_value) |v| self.allocator.free(v);
                 const challenge = try auth_mod.parseBearerChallenge(challenge_value orelse return error.Unauthorized);
                 defer challenge.deinit();
@@ -837,9 +846,11 @@ pub const Client = struct {
                     defer self.allocator.free(t);
                     try self.token_cache.put(image.registry, image.repository, .push, t, nowUnixSeconds(io));
                 }
+                // Last statement before continue: req is deinit'd exactly once.
+                container.req.deinit();
                 continue;
             }
-            return .{ .req = req, .resp = resp };
+            return .{ .container = container, .resp = resp };
         }
         return error.Unauthorized;
     }
@@ -850,14 +861,19 @@ pub const Client = struct {
     /// connection is reusable (Oracle m5).
     fn writeExpect(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, headers: []const std.http.Header, body: []u8, want: std.http.Status) !WriteResult {
         var attempt = try self.writeRequest(io, image, creds, method, uri, headers, body);
-        defer attempt.req.deinit();
+        defer {
+            attempt.container.req.deinit();
+            attempt.container.client.deinit();
+            self.allocator.destroy(attempt.container);
+        }
         const status = attempt.resp.head.status;
 
         if (status != want) {
             const err_body = try readBody(self.allocator, &attempt.resp);
             defer self.allocator.free(err_body);
             if (status == .unauthorized) return error.Unauthorized;
-            return mapErrorFromEnvelope(self.allocator, err_body);
+            mapErrorFromEnvelope(self.allocator, err_body) catch |err| return err;
+            unreachable;
         }
 
         // Location must be copied BEFORE resp.reader() invalidates head.
@@ -960,11 +976,21 @@ const OpenBlob = struct {
     resp: std.http.Client.Response,
 };
 
-/// In-flight write request; the caller must keep `req` alive while consuming
-/// `resp` (body reader borrows it), then `req.deinit()`.
+/// In-flight write request. The `WriteHttp` container keeps the http.Client,
+/// the Request, and the redirect buffer alive; the caller consumes `resp`,
+/// then releases the container (req.deinit -> client.deinit -> destroy).
 const WriteAttempt = struct {
-    req: std.http.Client.Request,
+    container: *WriteHttp,
     resp: std.http.Client.Response,
+};
+
+/// Heap container for a write request: the http.Client must outlive its
+/// Request (Client.deinit asserts no active requests), and the response head
+/// borrows the redirect buffer.
+const WriteHttp = struct {
+    client: std.http.Client,
+    req: std.http.Client.Request,
+    redirect_buf: [8192]u8 = undefined,
 };
 
 /// Owned result of a write request: status plus the copied Location header
@@ -1106,10 +1132,12 @@ fn appendDigestQuery(allocator: Allocator, url: []const u8, digest_str: []const 
     return std.fmt.allocPrint(allocator, "{s}?digest={s}", .{ url, digest_str });
 }
 
-/// "bytes {start}-{end_inclusive}" — the OCI upload PATCH Content-Range form
-/// with an INCLUSIVE end offset.
+/// "{start}-{end_inclusive}" — the OCI upload PATCH Content-Range form with
+/// an INCLUSIVE end offset. Note: no "bytes " prefix (proven against zot:
+/// the prefixed form is rejected with 416; the bare form matches the OCI
+/// distribution spec's `Content-Range: <start>-<end>` for uploads).
 fn contentRangeHeader(allocator: Allocator, start: u64, end_inclusive: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "bytes {d}-{d}", .{ start, end_inclusive });
+    return std.fmt.allocPrint(allocator, "{d}-{d}", .{ start, end_inclusive });
 }
 
 /// Maps a registry error envelope body to a client error: DIGEST_INVALID ->
@@ -1337,10 +1365,10 @@ test "contentRangeHeader inclusive end" {
     const a = std.testing.allocator;
     const r1 = try contentRangeHeader(a, 0, 4_194_303);
     defer a.free(r1);
-    try std.testing.expectEqualStrings("bytes 0-4194303", r1);
+    try std.testing.expectEqualStrings("0-4194303", r1);
     const r2 = try contentRangeHeader(a, 4_194_304, 8_388_607);
     defer a.free(r2);
-    try std.testing.expectEqualStrings("bytes 4194304-8388607", r2);
+    try std.testing.expectEqualStrings("4194304-8388607", r2);
 }
 
 test "mapErrorFromEnvelope maps codes and garbage" {

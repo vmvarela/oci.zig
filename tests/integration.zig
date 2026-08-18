@@ -181,3 +181,168 @@ test "Tier 1 client against zot" {
     const missing_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/testrepo:nonexistent", .{registry}));
     try std.testing.expectError(error.NotFound, c.pullManifest(io, missing_ref, .anonymous));
 }
+
+test "Tier 2 write path against zot" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const registry = try registryHost(a);
+    var c = client.Client.init(a, .{ .protocol = .http });
+    defer c.deinit();
+
+    // Unique suffix per run so re-runs never collide with prior content.
+    const ts = std.Io.Timestamp.toSeconds(std.Io.Clock.real.now(io));
+    var prng = std.Random.DefaultPrng.init(@intCast(ts));
+
+    // --- pushBlob round-trip: 1 MiB random ---
+    {
+        const ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wblob-{d}", .{ registry, ts }));
+        const data = try a.alloc(u8, 1_048_576);
+        prng.random().bytes(data);
+        const digest = try c.pushBlob(io, ref, .anonymous, data);
+        var aw = std.Io.Writer.Allocating.init(a);
+        defer aw.deinit();
+        try c.pullBlob(io, ref, digest, &aw.writer);
+        try std.testing.expectEqualSlices(u8, data, aw.written());
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &h, .{});
+        const hex = std.fmt.bytesToHex(h, .lower);
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "sha256:{s}", .{&hex}), digest);
+    }
+
+    // --- pushBlobStream: 5 MiB (forces >=2 PATCH chunks) + empty blob ---
+    {
+        const ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wstream-{d}", .{ registry, ts }));
+        const data5 = try a.alloc(u8, 5 * 1_048_576);
+        prng.random().bytes(data5);
+        const d5 = try c.pushBlobStream(io, ref, .anonymous, std.Io.Reader.fixed(data5), data5.len);
+        var aw = std.Io.Writer.Allocating.init(a);
+        defer aw.deinit();
+        try c.pullBlob(io, ref, d5, &aw.writer);
+        try std.testing.expectEqualSlices(u8, data5, aw.written());
+
+        // Empty blob: no PATCHes, finalize only.
+        const empty = try c.pushBlobStream(io, ref, .anonymous, std.Io.Reader.fixed(&.{}), 0);
+        try std.testing.expectEqualStrings("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", empty);
+        var aw2 = std.Io.Writer.Allocating.init(a);
+        defer aw2.deinit();
+        try c.pullBlob(io, ref, empty, &aw2.writer);
+        try std.testing.expectEqual(@as(usize, 0), aw2.written().len);
+    }
+
+    // --- pushManifest + write-parity: DCD == our canonical digest ---
+    // zot validates that referenced blobs exist IN the manifest's repo, so
+    // config + layer are pushed into the same repository as the manifest.
+    const man_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wman-{d}:write-{d}", .{ registry, ts, ts }));
+    const cfg_digest = try c.pushBlob(io, man_ref, .anonymous, config_fixture);
+    const layer_small = try a.alloc(u8, 64 * 1024);
+    prng.random().bytes(layer_small);
+    const layer_digest = try c.pushBlob(io, man_ref, .anonymous, layer_small);
+
+    const man_layers = try a.alloc(manifest.OciDescriptor, 1);
+    man_layers[0] = .{ .media_type = manifest.oci_layer, .digest = layer_digest, .size = layer_small.len };
+    const man = manifest.OciImageManifest{
+        .schema_version = 2,
+        .media_type = manifest.oci_manifest,
+        .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest, .size = config_fixture.len },
+        .layers = man_layers,
+    };
+    const pushed = try c.pushManifest(io, man_ref, .anonymous, &.{ .manifest = man });
+    const dcd = try c.fetchManifestDigest(io, man_ref, .anonymous);
+    // Parity proof: zot's Docker-Content-Digest is the sha256 of the exact
+    // canonical bytes we sent; our locally computed canonical digest must
+    // equal it. pushManifest's returned value is the registry Location,
+    // which carries that digest as its final path component.
+    const local_value = try manifestToValue(a, man);
+    const local_digest = try canonical_json.digestString(a, local_value);
+    try std.testing.expectEqualStrings(local_digest, dcd);
+    try std.testing.expect(std.mem.endsWith(u8, pushed, dcd));
+    const back = try c.pullManifest(io, man_ref, .anonymous);
+    try std.testing.expectEqualStrings(cfg_digest, back.manifest.manifest.config.?.digest);
+    try std.testing.expectEqualStrings(layer_digest, back.manifest.manifest.layers[0].digest);
+
+    // --- pushManifestRaw: same canonical bytes, raw content-type ---
+    const raw_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wman-{d}:raw-{d}", .{ registry, ts, ts }));
+    const canonical_body = try canonical_json.stringify(a, local_value);
+    const raw_pushed = try c.pushManifestRaw(io, raw_ref, .anonymous, canonical_body, manifest.oci_manifest);
+    const raw_dcd = try c.fetchManifestDigest(io, raw_ref, .anonymous);
+    try std.testing.expectEqualStrings(dcd, raw_dcd);
+    try std.testing.expect(std.mem.endsWith(u8, raw_pushed, raw_dcd));
+
+    // --- pushManifestList: index referencing the pushed manifest ---
+    const idx_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wman-{d}:idx-{d}", .{ registry, ts, ts }));
+    const idx_manifests = try a.alloc(manifest.OciDescriptor, 1);
+    idx_manifests[0] = .{ .media_type = manifest.oci_manifest, .digest = dcd, .size = canonical_body.len };
+    const index = manifest.OciImageIndex{
+        .schema_version = 2,
+        .media_type = manifest.oci_index,
+        .manifests = idx_manifests,
+    };
+    const idx_pushed = try c.pushManifestList(io, idx_ref, .anonymous, &index);
+    const idx_back = try c.pullManifest(io, idx_ref, .anonymous);
+    try std.testing.expect(idx_back.manifest.isIndex());
+    try std.testing.expectEqualStrings(manifest.oci_index, idx_back.manifest.mediaType().?);
+    try std.testing.expectEqualStrings(dcd, idx_back.manifest.index.manifests[0].digest);
+    try std.testing.expect(std.mem.endsWith(u8, idx_pushed, idx_back.digest));
+
+    // --- push wrapper: build manifest from config + two layers ---
+    {
+        const push_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wpush-{d}:write-{d}", .{ registry, ts, ts }));
+        const lay_a = try a.alloc(u8, 32 * 1024);
+        prng.random().bytes(lay_a);
+        const lay_b = try a.alloc(u8, 64 * 1024);
+        prng.random().bytes(lay_b);
+        const res = try c.push(io, push_ref, .anonymous, null, config_fixture, &.{ lay_a, lay_b });
+        const push_dcd = try c.fetchManifestDigest(io, push_ref, .anonymous);
+        try std.testing.expect(std.mem.endsWith(u8, res.manifest_digest, push_dcd));
+        const mc = try c.pullManifestAndConfig(io, push_ref, .anonymous);
+        try std.testing.expectEqualStrings(config_digest, mc.config_digest);
+        try std.testing.expectEqualSlices(u8, config_fixture, mc.config);
+        try std.testing.expectEqual(@as(usize, 2), mc.manifest.layers.len);
+    }
+
+    // --- mountBlob: push to source repo, mount into target repo ---
+    {
+        const src_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wsrc-{d}", .{ registry, ts }));
+        const dst_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wdst-{d}", .{ registry, ts }));
+        const data = try a.alloc(u8, 128 * 1024);
+        prng.random().bytes(data);
+        const digest = try c.pushBlob(io, src_ref, .anonymous, data);
+        try c.mountBlob(io, dst_ref, .anonymous, src_ref, digest);
+        var aw = std.Io.Writer.Allocating.init(a);
+        defer aw.deinit();
+        try c.pullBlob(io, dst_ref, digest, &aw.writer);
+        try std.testing.expectEqualSlices(u8, data, aw.written());
+    }
+
+    // --- error paths: no crash ---
+    {
+        // mountBlob with a never-pushed digest: any error is acceptable.
+        const ghost = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        const dst_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wdst-{d}", .{ registry, ts }));
+        const src_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wsrc-{d}", .{ registry, ts }));
+        if (c.mountBlob(io, dst_ref, .anonymous, src_ref, ghost)) |_| {
+            return error.TestUnexpectedResult;
+        } else |_| {}
+
+        // docker-schema2 media type: zot 415s -> MANIFEST_INVALID -> InvalidManifest.
+        const bad_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wman-{d}:bad-{d}", .{ registry, ts, ts }));
+        const bad_layers = try a.alloc(manifest.OciDescriptor, 1);
+        bad_layers[0] = .{ .media_type = manifest.docker_layer_gzip, .digest = layer_digest, .size = layer_small.len };
+        const bad_man = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.docker_manifest_v2,
+            .config = .{ .media_type = manifest.docker_config, .digest = cfg_digest, .size = config_fixture.len },
+            .layers = bad_layers,
+        };
+        try std.testing.expectError(error.InvalidManifest, c.pushManifest(io, bad_ref, .anonymous, &.{ .manifest = bad_man }));
+    }
+}
