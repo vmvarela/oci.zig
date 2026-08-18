@@ -412,9 +412,16 @@ pub const Client = struct {
     }
 
     /// Lists the referrers of `image`'s digest (OCI 1.1 referrers API),
-    /// optionally filtered by `artifact_type`. On a 404 from the referrers
-    /// endpoint, falls back to fetching the manifest by digest with
-    /// `Accept: oci_index` (upstream parity). Returns the index descriptors.
+    /// optionally filtered by `artifact_type` (exact match). Requests use the
+    /// distribution media-type Accept header. On a 404 from the referrers
+    /// endpoint, falls back to the tag schema: fetches `manifests/{tag}`
+    /// where the tag is the digest with ':' replaced by '-'. A not-found
+    /// fallback returns an EMPTY descriptor slice (no-referrers sentinel, not
+    /// an error); a fallback resolving to a non-index document is an error
+    /// (InvalidResponse). When `artifact_type` is set, the fallback
+    /// descriptors are filtered client-side, order preserved. Ownership:
+    /// descriptor strings are arena-allocated by `manifest.OciManifest.parse`;
+    /// the returned slice references them.
     pub fn pullReferrers(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, artifact_type: ?[]const u8) ![]manifest.OciDescriptor {
         const digest_str = image.digest orelse return error.InvalidReference;
         const path = try std.fmt.allocPrint(self.allocator, "referrers/{s}", .{digest_str});
@@ -427,18 +434,37 @@ pub const Client = struct {
         const url = try buildUrl(self.allocator, self.config, image, path, query);
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
+        const accept = try acceptHeader(self.allocator, &distribution_accept_types);
+        defer self.allocator.free(accept);
 
-        var result = self.getBody(io, image, creds, .pull, uri, &.{.{ .name = "Accept", .value = manifest.oci_index }}) catch |err| switch (err) {
+        var result = self.getBody(io, image, creds, .pull, uri, &.{.{ .name = "Accept", .value = accept }}) catch |err| switch (err) {
             error.NotFound => {
-                // Fallback: fetch the manifest by digest as an index.
-                const path2 = try std.fmt.allocPrint(self.allocator, "manifests/{s}", .{digest_str});
+                // Tag-schema fallback: digest "sha256:abc" -> tag "sha256-abc".
+                const tag = try std.mem.replaceOwned(u8, self.allocator, digest_str, ":", "-");
+                defer self.allocator.free(tag);
+                const path2 = try std.fmt.allocPrint(self.allocator, "manifests/{s}", .{tag});
                 defer self.allocator.free(path2);
                 const url2 = try buildUrl(self.allocator, self.config, image, path2, null);
                 defer self.allocator.free(url2);
                 const uri2 = try std.Uri.parse(url2);
-                var r2 = try self.getBody(io, image, creds, .pull, uri2, &.{.{ .name = "Accept", .value = manifest.oci_index }});
+                var r2 = self.getBody(io, image, creds, .pull, uri2, &.{.{ .name = "Accept", .value = accept }}) catch |e| switch (e) {
+                    // No tag-schema manifest either: no referrers at all.
+                    error.NotFound => return &[_]manifest.OciDescriptor{},
+                    else => return e,
+                };
                 defer r2.deinit(self.allocator);
-                return indexDescriptors(self.allocator, r2.body);
+                const descs = try indexDescriptors(self.allocator, r2.body);
+                if (artifact_type) |at| {
+                    var filtered = std.ArrayList(manifest.OciDescriptor).empty;
+                    defer filtered.deinit(self.allocator);
+                    for (descs) |d| {
+                        if (d.artifact_type) |dt| {
+                            if (std.mem.eql(u8, dt, at)) try filtered.append(self.allocator, d);
+                        }
+                    }
+                    return filtered.toOwnedSlice(self.allocator);
+                }
+                return descs;
             },
             else => return err,
         };
@@ -1108,6 +1134,15 @@ const manifest_accept_types = [_][]const u8{
     manifest.oci_artifact,
 };
 
+/// The four distribution manifest media types accepted on referrers and
+/// tag-schema fallback requests (upstream MIME_TYPES_DISTRIBUTION_MANIFEST).
+const distribution_accept_types = [_][]const u8{
+    manifest.docker_manifest_v2,
+    manifest.docker_manifest_list,
+    manifest.oci_manifest,
+    manifest.oci_index,
+};
+
 /// Joins media types into a single `Accept` header value.
 fn acceptHeader(allocator: Allocator, types: []const []const u8) ![]u8 {
     return std.mem.join(allocator, ",", types);
@@ -1438,6 +1473,35 @@ test "currentPlatformResolver matches the build host" {
         .{ .media_type = manifest.oci_manifest, .digest = "sha256:other", .size = 1, .platform = .{ .architecture = "s390x", .os = "linux" } },
     };
     try std.testing.expectEqualStrings("sha256:host", currentPlatformResolver(&descriptors).?);
+}
+
+test "resolver skips descriptors without platform" {
+    const descriptors = [_]manifest.OciDescriptor{
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:null-before", .size = 1 },
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:match", .size = 1, .platform = .{ .architecture = "amd64", .os = "linux" } },
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:null-after", .size = 1 },
+    };
+    try std.testing.expectEqualStrings("sha256:match", linuxAmd64Resolver(&descriptors).?);
+}
+
+test "resolver ignores variant and os.version" {
+    const descriptors = [_]manifest.OciDescriptor{
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:v8", .size = 1, .platform = .{ .architecture = "arm64", .os = "linux", .variant = "v8" } },
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:osver", .size = 1, .platform = .{ .architecture = "windows", .os = "windows", .os_version = "10.0.17763.0" } },
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:v7", .size = 1, .platform = .{ .architecture = "arm64", .os = "linux", .variant = "v7" } },
+    };
+    // Matching ignores variant/os.version: the first arm64/linux entry wins even
+    // though a later entry shares os/arch with a different variant.
+    try std.testing.expectEqualStrings("sha256:v8", resolvePlatform(&descriptors, "arm64", "linux").?);
+    try std.testing.expectEqualStrings("sha256:osver", resolvePlatform(&descriptors, "windows", "windows").?);
+}
+
+test "resolver returns the first match in descriptor order" {
+    const descriptors = [_]manifest.OciDescriptor{
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:first", .size = 1, .platform = .{ .architecture = "amd64", .os = "linux" } },
+        .{ .media_type = manifest.oci_manifest, .digest = "sha256:second", .size = 1, .platform = .{ .architecture = "amd64", .os = "linux" } },
+    };
+    try std.testing.expectEqualStrings("sha256:first", linuxAmd64Resolver(&descriptors).?);
 }
 
 test "buildTokenUrlString uses the passed scope" {
