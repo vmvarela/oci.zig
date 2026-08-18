@@ -1,0 +1,10 @@
+# Deepwork state (git-local, OpenCode-readable)
+.slim/deepwork/
+
+# Zig
+.zig-cache/
+zig-out/
+zig-cache/
+
+# Zig package cache (local fetch extraction)
+zig-pkg/
