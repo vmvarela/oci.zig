@@ -19,6 +19,8 @@ pub const OciError = error{
     UnexpectedStatus,
     /// A digest string failed to parse.
     InvalidDigest,
+    /// A manifest was rejected by the registry.
+    InvalidManifest,
     /// An image reference failed to parse.
     InvalidReference,
     /// The registry response body was malformed.

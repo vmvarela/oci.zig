@@ -25,6 +25,7 @@ const auth_mod = @import("auth.zig");
 const token_cache = @import("token_cache.zig");
 const manifest = @import("manifest.zig");
 const blob = @import("blob.zig");
+const canonical_json = @import("canonical_json.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -150,39 +151,9 @@ pub const Client = struct {
         defer challenge.deinit();
 
         // Token request: GET realm?service=..&scope=.. with the caller's creds.
-        const token_url_str = try self.buildTokenUrlString(challenge);
-        defer self.allocator.free(token_url_str);
-        const token_uri = try std.Uri.parse(token_url_str);
-
-        const auth_value = try secrets.basicAuthHeader(creds, self.allocator);
-        defer if (auth_value) |v| self.allocator.free(v);
-
-        var req2 = try http.request(.GET, token_uri, .{
-            .redirect_behavior = .unhandled,
-            .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
-        });
-        defer req2.deinit();
-        try req2.sendBodiless();
-        var resp2 = try req2.receiveHead(&redirect_buf);
-        if (resp2.head.status != .ok) {
-            return error.Unauthorized;
-        }
-        var transfer_buf: [8192]u8 = undefined;
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.allocator);
-        const reader = resp2.reader(&transfer_buf);
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = try reader.readSliceShort(&chunk);
-            if (n == 0) break;
-            try out.appendSlice(self.allocator, chunk[0..n]);
-        }
-
-        const TokenResp = struct { token: ?[]const u8 = null, access_token: ?[]const u8 = null };
-        const parsed = try std.json.parseFromSliceLeaky(TokenResp, self.allocator, out.items, .{ .ignore_unknown_fields = true });
-        const token = parsed.token orelse parsed.access_token orelse return error.InvalidResponse;
+        const token = try self.tokenFromChallenge(io, challenge, creds, challenge.scope orelse "") orelse return null;
         try self.token_cache.put(image.registry, image.repository, op, token, nowUnixSeconds(io));
-        return try self.allocator.dupe(u8, token);
+        return token;
     }
 
     /// Lists the tags of `image`'s repository. `n` limits the result and
@@ -416,6 +387,206 @@ pub const Client = struct {
         return self.auth(io, image, creds, op);
     }
 
+    /// Pushes `data` as a complete blob in a single monolithic PUT
+    /// (Oracle 1). Returns the allocated "sha256:<hex>" digest.
+    pub fn pushBlob(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, data: []const u8) ![]const u8 {
+        const digest_str = try sha256DigestString(self.allocator, data);
+        errdefer self.allocator.free(digest_str);
+        // sendBodyComplete needs a mutable buffer.
+        const body = try self.allocator.dupe(u8, data);
+        defer self.allocator.free(body);
+
+        const session_url = try buildUrl(self.allocator, self.config, image, "blobs/uploads/", null);
+        defer self.allocator.free(session_url);
+        const session_uri = try std.Uri.parse(session_url);
+        const session = try self.writeExpect(io, image, creds, .POST, session_uri, &.{}, &.{}, .accepted);
+        defer if (session.location) |l| self.allocator.free(l);
+        const loc = session.location orelse return error.InvalidResponse;
+
+        const loc_url = try locationToUrl(self.allocator, self.config, image.registry, loc);
+        defer self.allocator.free(loc_url);
+        const put_url = try appendDigestQuery(self.allocator, loc_url, digest_str);
+        defer self.allocator.free(put_url);
+        const put_uri = try std.Uri.parse(put_url);
+        const octet = "application/octet-stream";
+        const put = try self.writeExpect(io, image, creds, .PUT, put_uri, &.{
+            .{ .name = "Content-Type", .value = octet },
+        }, body, .created);
+        defer if (put.location) |l| self.allocator.free(l);
+        return digest_str;
+    }
+
+    /// Streams a blob from `reader` (any type exposing
+    /// `readSliceShort([]u8) !usize`) in chunks, PATCHing each chunk
+    /// (Oracle 1/7), then finalizing with the accumulated sha256 digest.
+    /// `size` == 0 skips the chunk loop (empty blob). Returns the allocated
+    /// "sha256:<hex>" digest.
+    pub fn pushBlobStream(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, reader: anytype, size: u64) ![]const u8 {
+        const octet = "application/octet-stream";
+        const buf = try self.allocator.alloc(u8, 4096 * 1024);
+        defer self.allocator.free(buf);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+
+        const session_url = try buildUrl(self.allocator, self.config, image, "blobs/uploads/", null);
+        defer self.allocator.free(session_url);
+        const session_uri = try std.Uri.parse(session_url);
+        const session = try self.writeExpect(io, image, creds, .POST, session_uri, &.{}, &.{}, .accepted);
+        // Ownership of session.location moves into `loc` (single owner).
+        var loc: ?[]u8 = session.location orelse return error.InvalidResponse;
+        defer if (loc) |l| self.allocator.free(l);
+
+        var start: u64 = 0;
+        if (size > 0) {
+            while (true) {
+                const n = try reader.readSliceShort(buf);
+                if (n == 0) break;
+                hasher.update(buf[0..n]);
+                const end = start + n - 1;
+
+                const range = try contentRangeHeader(self.allocator, start, end);
+                errdefer self.allocator.free(range);
+                const loc_url = try locationToUrl(self.allocator, self.config, image.registry, loc.?);
+                errdefer self.allocator.free(loc_url);
+                const patch_uri = try std.Uri.parse(loc_url);
+                const patch = try self.writeExpect(io, image, creds, .PATCH, patch_uri, &.{
+                    .{ .name = "Content-Range", .value = range },
+                    .{ .name = "Content-Type", .value = octet },
+                }, buf[0..n], .accepted);
+                self.allocator.free(range);
+                self.allocator.free(loc_url);
+                self.allocator.free(loc.?);
+                loc = patch.location;
+                if (loc == null) return error.InvalidResponse;
+                start = end + 1;
+            }
+        }
+
+        var out: [32]u8 = undefined;
+        hasher.final(&out);
+        const hex = std.fmt.bytesToHex(out, .lower);
+        const digest_str = try std.fmt.allocPrint(self.allocator, "sha256:{s}", .{&hex});
+        errdefer self.allocator.free(digest_str);
+
+        const loc_url = try locationToUrl(self.allocator, self.config, image.registry, loc.?);
+        defer self.allocator.free(loc_url);
+        const fin_url = try appendDigestQuery(self.allocator, loc_url, digest_str);
+        defer self.allocator.free(fin_url);
+        const fin_uri = try std.Uri.parse(fin_url);
+        const fin = try self.writeExpect(io, image, creds, .PUT, fin_uri, &.{}, &.{}, .created);
+        defer if (fin.location) |l| self.allocator.free(l);
+        return digest_str;
+    }
+
+    /// Cross-repo blob mount: POST with `?mount={digest_str}&from={source}`.
+    /// Expects 201 (mounted). Any other status — including the 202 session
+    /// fallback — is an error (Oracle 4: no fallback in the client).
+    pub fn mountBlob(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, source: reference.Reference, digest_str: []const u8) !void {
+        _ = try digest.parse(digest_str);
+        const query = try std.fmt.allocPrint(self.allocator, "mount={s}&from={s}", .{ digest_str, source.repository });
+        defer self.allocator.free(query);
+        const url = try buildUrl(self.allocator, self.config, image, "blobs/uploads/", query);
+        defer self.allocator.free(url);
+        const uri = try std.Uri.parse(url);
+        const result = try self.writeExpect(io, image, creds, .POST, uri, &.{}, &.{}, .created);
+        defer if (result.location) |l| self.allocator.free(l);
+    }
+
+    /// Puts `body` verbatim as `image`'s manifest under the given content
+    /// type (Oracle m3). Reference: tag if set, else digest, else "latest".
+    /// Returns the registry Location header (the canonical manifest URL), or
+    /// the sha256 of `body` when the registry omits Location (Oracle m4).
+    pub fn pushManifestRaw(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, body: []const u8, content_type: []const u8) ![]const u8 {
+        const ref_part = try manifestRef(self.allocator, image);
+        defer self.allocator.free(ref_part);
+        const path = try std.fmt.allocPrint(self.allocator, "manifests/{s}", .{ref_part});
+        defer self.allocator.free(path);
+        const url = try buildUrl(self.allocator, self.config, image, path, null);
+        defer self.allocator.free(url);
+        const uri = try std.Uri.parse(url);
+
+        const body_copy = try self.allocator.dupe(u8, body); // sendBodyComplete needs mutable
+        defer self.allocator.free(body_copy);
+        const result = try self.writeExpect(io, image, creds, .PUT, uri, &.{
+            .{ .name = "Content-Type", .value = content_type },
+        }, body_copy, .created);
+        if (result.location) |l| return l;
+        return sha256DigestString(self.allocator, body);
+    }
+
+    /// Puts a manifest document, serialized canonically (RFC 8785, sorted
+    /// keys); the returned digest is the sha256 of the canonical bytes sent.
+    pub fn pushManifest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, m: *const manifest.OciManifest) ![]const u8 {
+        const body = try manifestCanonicalBytes(self.allocator, m);
+        defer self.allocator.free(body);
+        const content_type = m.mediaType() orelse manifest.oci_manifest;
+        return self.pushManifestRaw(io, image, creds, body, content_type);
+    }
+
+    /// Puts an image index, serialized canonically.
+    pub fn pushManifestList(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, index: *const manifest.OciImageIndex) ![]const u8 {
+        const wrapped = manifest.OciManifest{ .index = index.* };
+        return self.pushManifest(io, image, creds, &wrapped);
+    }
+
+    /// Pushes layers (each as a blob), then config, then the manifest
+    /// (Oracle m5 ordering). When `manifest` is null, one is built from
+    /// `config` + `layers` (config required in that case). Returns the
+    /// manifest digest and the manifest URL that was PUT to.
+    pub fn push(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, manifest_opt: ?manifest.OciImageManifest, config: ?[]const u8, layers: []const []const u8) !struct { manifest_digest: []const u8, manifest_url: []const u8 } {
+        const ref_part = try manifestRef(self.allocator, image);
+        defer self.allocator.free(ref_part);
+        const path = try std.fmt.allocPrint(self.allocator, "manifests/{s}", .{ref_part});
+        defer self.allocator.free(path);
+        const manifest_url = try buildUrl(self.allocator, self.config, image, path, null);
+        errdefer self.allocator.free(manifest_url);
+
+        if (manifest_opt) |m| {
+            const wrapped = manifest.OciManifest{ .manifest = m };
+            const digest_str = try self.pushManifest(io, image, creds, &wrapped);
+            return .{ .manifest_digest = digest_str, .manifest_url = manifest_url };
+        }
+        if (config == null) return error.InvalidResponse;
+
+        // Layers first, then config, then manifest.
+        const layer_digests = try self.allocator.alloc([]const u8, layers.len);
+        var pushed: usize = 0;
+        errdefer {
+            for (layer_digests[0..pushed]) |d| self.allocator.free(d);
+            self.allocator.free(layer_digests);
+        }
+        for (layers, 0..) |l, i| {
+            layer_digests[i] = try self.pushBlob(io, image, creds, l);
+            pushed += 1;
+        }
+        defer for (layer_digests) |d| self.allocator.free(d);
+
+        const config_digest = try self.pushBlob(io, image, creds, config.?);
+        defer self.allocator.free(config_digest);
+
+        const layer_descs = try self.allocator.alloc(manifest.OciDescriptor, layers.len);
+        defer self.allocator.free(layer_descs);
+        for (layers, 0..) |l, i| {
+            layer_descs[i] = .{
+                .media_type = manifest.oci_layer,
+                .digest = layer_digests[i],
+                .size = l.len,
+            };
+        }
+        const built = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .config = .{
+                .media_type = manifest.oci_config,
+                .digest = config_digest,
+                .size = config.?.len,
+            },
+            .layers = layer_descs,
+        };
+        const wrapped = manifest.OciManifest{ .manifest = built };
+        const digest_str = try self.pushManifest(io, image, creds, &wrapped);
+        return .{ .manifest_digest = digest_str, .manifest_url = manifest_url };
+    }
+
     // ---- internal helpers ----
 
     fn pullManifestImpl(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, accept_types: []const []const u8) !PulledManifest {
@@ -574,7 +745,137 @@ pub const Client = struct {
         return error.Unauthorized;
     }
 
-    fn buildTokenUrlString(self: *Client, challenge: auth_mod.Challenge) ![]u8 {
+    /// Fetches a bearer token from the challenge's realm with `creds` and the
+    /// given `scope` (per-request, not the challenge's scope). Returns the
+    /// token (allocator-owned) or null when `creds` is anonymous. Caching of
+    /// the returned token is the caller's job (the registry/repo of the cache
+    /// key live at the call site).
+    fn tokenFromChallenge(self: *Client, io: Io, challenge: auth_mod.Challenge, creds: secrets.RegistryAuth, scope: []const u8) !?[]const u8 {
+        if (creds == .anonymous) return null;
+        const token_url_str = try self.buildTokenUrlString(challenge, scope);
+        defer self.allocator.free(token_url_str);
+        const token_uri = try std.Uri.parse(token_url_str);
+
+        const auth_value = try secrets.basicAuthHeader(creds, self.allocator);
+        defer if (auth_value) |v| self.allocator.free(v);
+
+        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        defer http.deinit();
+        var redirect_buf: [8192]u8 = undefined;
+        var req = try http.request(.GET, token_uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
+        });
+        defer req.deinit();
+        try req.sendBodiless();
+        var resp = try req.receiveHead(&redirect_buf);
+        if (resp.head.status != .ok) return error.Unauthorized;
+
+        var transfer_buf: [8192]u8 = undefined;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        const reader = resp.reader(&transfer_buf);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = try reader.readSliceShort(&chunk);
+            if (n == 0) break;
+            try out.appendSlice(self.allocator, chunk[0..n]);
+        }
+
+        const TokenResp = struct { token: ?[]const u8 = null, access_token: ?[]const u8 = null };
+        const parsed = try std.json.parseFromSliceLeaky(TokenResp, self.allocator, out.items, .{ .ignore_unknown_fields = true });
+        const token = parsed.token orelse parsed.access_token orelse return error.InvalidResponse;
+        return try self.allocator.dupe(u8, token);
+    }
+
+    /// Sends a write-path request with the 401 -> Bearer token retry
+    /// (Oracle M1): first attempt uses `authorizationHeader` (cached token or
+    /// caller creds); on 401, parses the Bearer challenge from the FAILED
+    /// response, fetches a token with scope "repository:{repo}:pull,push",
+    /// caches it under (registry, repo, .push), and retries once. Anonymous
+    /// creds never retry. Returns the request + response; the caller keeps
+    /// `req` alive while consuming `resp`, then calls `req.deinit()`.
+    fn writeRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, extra_headers: []const std.http.Header, body: []u8) !WriteAttempt {
+        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        defer http.deinit();
+        var redirect_buf: [8192]u8 = undefined;
+
+        var attempts: usize = 0;
+        while (attempts < 2) : (attempts += 1) {
+            const auth_value = try self.authorizationHeader(io, image, creds, .push);
+            defer if (auth_value) |v| self.allocator.free(v);
+
+            var req = try http.request(method, uri, .{
+                .redirect_behavior = .unhandled,
+                .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
+                .extra_headers = extra_headers,
+            });
+            errdefer req.deinit();
+            try req.sendBodyComplete(body);
+            var resp = try req.receiveHead(&redirect_buf);
+            const status = resp.head.status;
+
+            if (status == .unauthorized and attempts == 0 and creds != .anonymous) {
+                // Extract the challenge BEFORE req.deinit() (head strings
+                // borrow the connection buffer).
+                var challenge_value: ?[]const u8 = null;
+                var it = resp.head.iterateHeaders();
+                while (it.next()) |h| {
+                    if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
+                        challenge_value = try self.allocator.dupe(u8, h.value);
+                        break;
+                    }
+                }
+                req.deinit();
+                defer if (challenge_value) |v| self.allocator.free(v);
+                const challenge = try auth_mod.parseBearerChallenge(challenge_value orelse return error.Unauthorized);
+                defer challenge.deinit();
+                const scope = try std.fmt.allocPrint(self.allocator, "repository:{s}:pull,push", .{image.repository});
+                defer self.allocator.free(scope);
+                const token = try self.tokenFromChallenge(io, challenge, creds, scope);
+                if (token) |t| {
+                    defer self.allocator.free(t);
+                    try self.token_cache.put(image.registry, image.repository, .push, t, nowUnixSeconds(io));
+                }
+                continue;
+            }
+            return .{ .req = req, .resp = resp };
+        }
+        return error.Unauthorized;
+    }
+
+    /// writeRequest + status gate: returns the (owned) Location on `want`,
+    /// or drains the body and maps the error (401 -> Unauthorized, else
+    /// mapErrorFromEnvelope). Always consumes the response body so the
+    /// connection is reusable (Oracle m5).
+    fn writeExpect(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, headers: []const std.http.Header, body: []u8, want: std.http.Status) !WriteResult {
+        var attempt = try self.writeRequest(io, image, creds, method, uri, headers, body);
+        defer attempt.req.deinit();
+        const status = attempt.resp.head.status;
+
+        if (status != want) {
+            const err_body = try readBody(self.allocator, &attempt.resp);
+            defer self.allocator.free(err_body);
+            if (status == .unauthorized) return error.Unauthorized;
+            return mapErrorFromEnvelope(self.allocator, err_body);
+        }
+
+        // Location must be copied BEFORE resp.reader() invalidates head.
+        var result = WriteResult{ .status = status };
+        errdefer if (result.location) |l| self.allocator.free(l);
+        var it = attempt.resp.head.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "location")) {
+                result.location = try self.allocator.dupe(u8, h.value);
+                break;
+            }
+        }
+        const drained = try readBody(self.allocator, &attempt.resp);
+        defer self.allocator.free(drained);
+        return result;
+    }
+
+    fn buildTokenUrlString(self: *Client, challenge: auth_mod.Challenge, scope: []const u8) ![]u8 {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         try buf.appendSlice(self.allocator, challenge.realm);
@@ -587,10 +888,10 @@ pub const Client = struct {
             defer self.allocator.free(enc);
             try buf.appendSlice(self.allocator, enc);
         }
-        if (challenge.scope) |s| {
+        if (scope.len > 0) {
             try buf.append(self.allocator, if (first) '?' else '&');
             try buf.appendSlice(self.allocator, "scope=");
-            const enc = try percentEncode(self.allocator, s);
+            const enc = try percentEncode(self.allocator, scope);
             defer self.allocator.free(enc);
             try buf.appendSlice(self.allocator, enc);
         }
@@ -658,6 +959,35 @@ const OpenBlob = struct {
     req: *std.http.Client.Request,
     resp: std.http.Client.Response,
 };
+
+/// In-flight write request; the caller must keep `req` alive while consuming
+/// `resp` (body reader borrows it), then `req.deinit()`.
+const WriteAttempt = struct {
+    req: std.http.Client.Request,
+    resp: std.http.Client.Response,
+};
+
+/// Owned result of a write request: status plus the copied Location header
+/// (null when absent). Free `location` with the Client's allocator.
+const WriteResult = struct {
+    status: std.http.Status,
+    location: ?[]u8 = null,
+};
+
+/// Reads the full response body (draining the connection). Caller frees.
+fn readBody(allocator: Allocator, resp: *std.http.Client.Response) ![]u8 {
+    var transfer_buf: [8192]u8 = undefined;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const reader = resp.reader(&transfer_buf);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = try reader.readSliceShort(&chunk);
+        if (n == 0) break;
+        try out.appendSlice(allocator, chunk[0..n]);
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 /// Owned GET result; free with `deinit`.
 const GetResult = struct {
@@ -744,6 +1074,71 @@ fn sha256DigestString(allocator: Allocator, bytes: []const u8) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(bytes, &out, .{});
     const hex = std.fmt.bytesToHex(out, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
+/// Manifest reference for push: tag if set, else digest, else "latest".
+fn manifestRef(allocator: Allocator, image: reference.Reference) ![]u8 {
+    if (image.tag) |t| return allocator.dupe(u8, t);
+    if (image.digest) |d| return allocator.dupe(u8, d);
+    return allocator.dupe(u8, "latest");
+}
+
+/// Resolves a registry `Location` response header to an absolute URL.
+/// Absolute locations are copied verbatim; relative ones (starting with "/")
+/// are prefixed with "{scheme}://{registry}" (zot returns relative Locations).
+fn locationToUrl(allocator: Allocator, config: ClientConfig, registry: []const u8, location: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, location, "http://") or std.mem.startsWith(u8, location, "https://")) {
+        return allocator.dupe(u8, location);
+    }
+    if (location.len > 0 and location[0] == '/') {
+        const scheme = config.scheme(registry);
+        return std.fmt.allocPrint(allocator, "{s}://{s}{s}", .{ scheme, registry, location });
+    }
+    return error.InvalidResponse;
+}
+
+/// Appends `?digest={digest}` (or `&digest={digest}` when the URL already
+/// carries a query) to a blob upload session URL.
+fn appendDigestQuery(allocator: Allocator, url: []const u8, digest_str: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, url, '?') != null) {
+        return std.fmt.allocPrint(allocator, "{s}&digest={s}", .{ url, digest_str });
+    }
+    return std.fmt.allocPrint(allocator, "{s}?digest={s}", .{ url, digest_str });
+}
+
+/// "bytes {start}-{end_inclusive}" — the OCI upload PATCH Content-Range form
+/// with an INCLUSIVE end offset.
+fn contentRangeHeader(allocator: Allocator, start: u64, end_inclusive: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "bytes {d}-{d}", .{ start, end_inclusive });
+}
+
+/// Maps a registry error envelope body to a client error: DIGEST_INVALID ->
+/// error.InvalidDigest, MANIFEST_INVALID -> error.InvalidManifest, anything
+/// else (including an unparseable body) -> error.UnexpectedStatus. Never
+/// errors on malformed JSON.
+fn mapErrorFromEnvelope(allocator: Allocator, body: []const u8) error{ InvalidDigest, InvalidManifest, UnexpectedStatus, OutOfMemory }!void {
+    const parsed = std.json.parseFromSlice(errors.OciEnvelope, allocator, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnexpectedStatus,
+    };
+    defer parsed.deinit();
+    if (parsed.value.errors.len == 0) return error.UnexpectedStatus;
+    switch (parsed.value.errors[0].code) {
+        .digest_invalid => return error.InvalidDigest,
+        .manifest_invalid => return error.InvalidManifest,
+        else => return error.UnexpectedStatus,
+    }
+}
+
+/// Serializes `m` through std.json (wire shape) then re-serializes the parsed
+/// Value canonically (RFC 8785, sorted keys). The returned bytes are the exact
+/// body that must be PUT to the registry.
+fn manifestCanonicalBytes(allocator: Allocator, m: *const manifest.OciManifest) ![]u8 {
+    const wire = try std.json.Stringify.valueAlloc(allocator, m.*, .{});
+    defer allocator.free(wire);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wire, .{});
+    defer parsed.deinit();
+    return canonical_json.stringify(allocator, parsed.value);
 }
 
 /// Current Unix time in seconds via the Io clock.
@@ -883,4 +1278,130 @@ test "currentPlatformResolver matches the build host" {
         .{ .media_type = manifest.oci_manifest, .digest = "sha256:other", .size = 1, .platform = .{ .architecture = "s390x", .os = "linux" } },
     };
     try std.testing.expectEqualStrings("sha256:host", currentPlatformResolver(&descriptors).?);
+}
+
+test "buildTokenUrlString uses the passed scope" {
+    const a = std.testing.allocator;
+    var client = Client.init(a, .{ .protocol = .http });
+    defer client.deinit();
+    // Literal challenge: never deinit (would free comptime strings).
+    const ch = auth_mod.Challenge{ .realm = "http://127.0.0.1:5000/auth", .service = "zot" };
+    const url = try client.buildTokenUrlString(ch, "repository:testrepo:pull,push");
+    defer a.free(url);
+    // ':' '/' ',' are percent-encoded; the passed scope must be in the URL.
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:5000/auth?service=zot&scope=repository%3Atestrepo%3Apull%2Cpush",
+        url,
+    );
+}
+
+test "tokenFromChallenge returns null for anonymous" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var client = Client.init(a, .{ .protocol = .http });
+    defer client.deinit();
+    const ch = auth_mod.Challenge{ .realm = "http://127.0.0.1:5000/auth" };
+    // Anonymous short-circuits before any I/O.
+    try std.testing.expectEqual(@as(?[]const u8, null), try client.tokenFromChallenge(io.io(), ch, .anonymous, "repository:x:pull"));
+}
+
+test "locationToUrl relative and absolute" {
+    const a = std.testing.allocator;
+    const cfg = ClientConfig{ .protocol = .http };
+
+    const rel = try locationToUrl(a, cfg, "127.0.0.1:5000", "/v2/testrepo/blobs/uploads/abc");
+    defer a.free(rel);
+    try std.testing.expectEqualStrings("http://127.0.0.1:5000/v2/testrepo/blobs/uploads/abc", rel);
+
+    const abs = try locationToUrl(a, cfg, "127.0.0.1:5000", "https://other.example/v2/x");
+    defer a.free(abs);
+    try std.testing.expectEqualStrings("https://other.example/v2/x", abs);
+
+    try std.testing.expectError(error.InvalidResponse, locationToUrl(a, cfg, "127.0.0.1:5000", "relative-path"));
+}
+
+test "appendDigestQuery joins with ? or &" {
+    const a = std.testing.allocator;
+
+    const plain = try appendDigestQuery(a, "http://h/v2/r/blobs/uploads/u", "sha256:abc");
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("http://h/v2/r/blobs/uploads/u?digest=sha256:abc", plain);
+
+    const with_q = try appendDigestQuery(a, "http://h/v2/r/blobs/uploads/u?foo=1", "sha256:abc");
+    defer a.free(with_q);
+    try std.testing.expectEqualStrings("http://h/v2/r/blobs/uploads/u?foo=1&digest=sha256:abc", with_q);
+}
+
+test "contentRangeHeader inclusive end" {
+    const a = std.testing.allocator;
+    const r1 = try contentRangeHeader(a, 0, 4_194_303);
+    defer a.free(r1);
+    try std.testing.expectEqualStrings("bytes 0-4194303", r1);
+    const r2 = try contentRangeHeader(a, 4_194_304, 8_388_607);
+    defer a.free(r2);
+    try std.testing.expectEqualStrings("bytes 4194304-8388607", r2);
+}
+
+test "mapErrorFromEnvelope maps codes and garbage" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidManifest,
+        mapErrorFromEnvelope(a, "{\"errors\":[{\"code\":\"MANIFEST_INVALID\"}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDigest,
+        mapErrorFromEnvelope(a, "{\"errors\":[{\"code\":\"DIGEST_INVALID\"}]}"),
+    );
+    try std.testing.expectError(
+        error.UnexpectedStatus,
+        mapErrorFromEnvelope(a, "{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}"),
+    );
+    try std.testing.expectError(error.UnexpectedStatus, mapErrorFromEnvelope(a, "not json at all"));
+    try std.testing.expectError(error.UnexpectedStatus, mapErrorFromEnvelope(a, "{\"errors\":[]}"));
+}
+
+test "manifestRef picks tag, then digest, then latest" {
+    const a = std.testing.allocator;
+
+    const with_tag = try reference.parse("registry.example.com/foo:my-tag");
+    const r1 = try manifestRef(a, with_tag);
+    defer a.free(r1);
+    try std.testing.expectEqualStrings("my-tag", r1);
+
+    const d = "sha256:3f57d9401f8d42f986df300f0c69192fc41da28ccc8d797829467780db3dd741";
+    const with_digest = try reference.parse("registry.example.com/foo@" ++ d);
+    const r2 = try manifestRef(a, with_digest);
+    defer a.free(r2);
+    try std.testing.expectEqualStrings(d, r2);
+
+    const neither = try reference.parse("registry.example.com/foo");
+    const r3 = try manifestRef(a, neither);
+    defer a.free(r3);
+    try std.testing.expectEqualStrings("latest", r3);
+}
+
+test "manifestCanonicalBytes digest matches the canonical body" {
+    const a = std.testing.allocator;
+    const m = manifest.OciManifest{ .manifest = .{ .layers = &.{} } };
+    const body = try manifestCanonicalBytes(a, &m);
+    defer a.free(body);
+
+    // The body must hash (independently recomputed) to the digest the
+    // registry will verify — asserts the canonical pipeline end to end.
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &out, .{});
+    const hex = std.fmt.bytesToHex(out, .lower);
+    const expected = try std.fmt.allocPrint(a, "sha256:{s}", .{&hex});
+    defer a.free(expected);
+    const recomputed = try sha256DigestString(a, body);
+    defer a.free(recomputed);
+    try std.testing.expectEqualStrings(expected, recomputed);
+
+    // body must equal canonical_json.stringify of the same parsed Value.
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const canonical = try canonical_json.stringify(a, parsed.value);
+    defer a.free(canonical);
+    try std.testing.expectEqualStrings(canonical, body);
 }
