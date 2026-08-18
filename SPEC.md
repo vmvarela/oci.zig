@@ -127,18 +127,18 @@ Not the `runtime` submodule (irrelevant here).
 
 Grouped into delivery tiers — see §12.
 
-**Tier 1 — read path (MVP)**
-- `Client.init(config: ClientConfig) Client`
-- `Client.auth(io, image: Reference, auth: RegistryAuth, op: RegistryOperation) !?[]const u8`
-- `Client.listTags(io, image, auth, ...) ![]const []const u8`
-- `Client.fetchManifestDigest(io, image, auth) ![]const u8`
-- `Client.pullManifest(io, image, auth) !struct { manifest: OciManifest, digest: []const u8 }`
-- `Client.pullManifestAndConfig(io, image, auth) !...`
+**Tier 1 — read path (MVP)** (implemented signatures; `creds` = `RegistryAuth`)
+- `Client.init(allocator, config: ClientConfig) Client`
+- `Client.auth(io, image: Reference, creds: RegistryAuth, op: RegistryOperation) !?[]const u8`
+- `Client.listTags(io, image, creds, n: ?usize, last: ?[]const u8) ![]const []const u8`
+- `Client.fetchManifestDigest(io, image, creds) ![]const u8`
+- `Client.pullManifest(io, image, creds) !struct { manifest: OciManifest, digest: []const u8 }`
+- `Client.pullManifestAndConfig(io, image, creds) !struct { manifest: OciImageManifest, config_digest: []const u8, config: []const u8 }`
 - `Client.pullBlob(io, image, digest, writer) !void`
-- `Client.pullBlobStream(io, image, digest) !BlobStream`
-- `Client.pullBlobStreamPartial(io, image, digest, range) !BlobStream`
-- `Client.pull(io, image, auth, accepted_media_types) !ImageData` (convenience wrapper)
-- `Client.pullReferrers(io, image, auth, artifact_type) ![]Descriptor`
+- `Client.pullBlobStream(io, image, digest) !BlobStreamResult` (stream + owning Request + container; `result.deinit()` after reads)
+- `Client.pullBlobStreamPartial(io, image, digest, offset, length) !BlobResponseResult` (partial — no digest verification)
+- `Client.pull(io, image, creds, accepted_media_types) !ImageData` (convenience wrapper)
+- `Client.pullReferrers(io, image, creds, artifact_type) ![]OciDescriptor` (404 → tag-schema fallback)
 - Platform resolvers: `linuxAmd64Resolver`, `windowsAmd64Resolver`, `currentPlatformResolver`
 
 **Tier 2 — write path**

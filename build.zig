@@ -40,6 +40,33 @@ pub fn build(b: *std.Build) void {
         });
         // Import is lazy; harmless on modules that never reference it.
         test_mod.root_module.addImport("ocispec", ocispec_mod);
-        test_step.dependOn(&test_mod.step);
+        // addTest's step only compiles; addRunArtifact actually executes the
+        // binary so `zig build test` runs (not just compiles) the tests.
+        const run = b.addRunArtifact(test_mod);
+        test_step.dependOn(&run.step);
     }
+
+    // Integration tests hit the network (a running zot registry) and are NOT
+    // part of the default `test` step. Run with `zig build integration-test`
+    // after pushing content via tests/setup.sh.
+    //
+    // The test imports the `root` module (which re-exports every submodule)
+    // under the name "oci". Importing the submodules individually would
+    // conflict: they use relative imports, so each is already part of the
+    // root module's file set.
+    const integration_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    // std.c.getenv (used to read OCI_TEST_REGISTRY) needs libc.
+    integration_test.root_module.link_libc = true;
+    integration_test.root_module.addImport("oci", b.modules.get("root").?);
+    integration_test.root_module.addImport("ocispec", ocispec_mod);
+    // addTest's step only compiles; addRunArtifact actually executes the binary.
+    const integration_run = b.addRunArtifact(integration_test);
+    const integration_step = b.step("integration-test", "Run integration tests against a running zot registry");
+    integration_step.dependOn(&integration_run.step);
 }

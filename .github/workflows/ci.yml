@@ -19,3 +19,32 @@ jobs:
           zig-version: 0.16.0
       - name: Build and test
         run: zig build test
+
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          zig-version: 0.16.0
+      - name: Download zot
+        run: |
+          curl -sfL -o zot https://github.com/project-zot/zot/releases/download/v2.1.20/zot-linux-amd64
+          chmod +x zot
+      - name: Start zot
+        run: |
+          cat > zot-config.json <<'EOF'
+          {
+            "storage": { "rootDirectory": "/tmp/zot" },
+            "http": { "address": "127.0.0.1", "port": "5000" }
+          }
+          EOF
+          ./zot serve zot-config.json &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5000/v2/ >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+      - name: Push test content
+        run: bash tests/setup.sh
+      - name: Integration tests
+        run: zig build integration-test
