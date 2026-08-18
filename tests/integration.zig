@@ -346,3 +346,191 @@ test "Tier 2 write path against zot" {
         try std.testing.expectError(error.InvalidManifest, c.pushManifest(io, bad_ref, .anonymous, &.{ .manifest = bad_man }));
     }
 }
+
+test "Tier 3 admin/misc against zot" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const registry = try registryHost(a);
+    var c = client.Client.init(a, .{ .protocol = .http });
+    defer c.deinit();
+
+    // Unique suffix per run so re-runs never collide with prior content.
+    const ts = std.Io.Timestamp.toSeconds(std.Io.Clock.real.now(io));
+    var prng = std.Random.DefaultPrng.init(@intCast(ts));
+
+    // --- catalog: full listing contains testrepo + this run's repo ---
+    {
+        const cat_repo = try std.fmt.allocPrint(a, "wcat-{d}", .{ts});
+        const cat_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/{s}:x", .{ registry, cat_repo }));
+        // Deterministic membership: push a blob so the repo exists in this run.
+        const seed = try a.alloc(u8, 4096);
+        prng.random().bytes(seed);
+        _ = try c.pushBlob(io, cat_ref, .anonymous, seed);
+
+        const test_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/testrepo:v1", .{registry}));
+        const repos = try c.catalog(io, test_ref, .anonymous, null, null);
+        var has_testrepo = false;
+        var has_cat_repo = false;
+        for (repos) |r| {
+            if (std.mem.eql(u8, r, "testrepo")) has_testrepo = true;
+            if (std.mem.eql(u8, r, cat_repo)) has_cat_repo = true;
+        }
+        try std.testing.expect(has_testrepo);
+        try std.testing.expect(has_cat_repo);
+
+        // --- catalog pagination walk: n=1, resume via last, bounded ---
+        // Termination: at most one page per repo plus one final empty page;
+        // a duplicate would mean the registry ignored `last`.
+        const max_pages = repos.len + 2;
+        var seen = std.StringHashMap(void).init(a);
+        var last: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < max_pages) : (pages += 1) {
+            const page = try c.catalog(io, test_ref, .anonymous, 1, last);
+            if (page.len == 0) break;
+            if (seen.contains(page[0])) return error.TestUnexpectedResult; // dup = bad pagination
+            try seen.put(page[0], {});
+            last = page[0];
+        }
+        try std.testing.expect(pages < max_pages); // terminated via empty page, not the cap
+        // The walk's union covers the full listing.
+        for (repos) |r| try std.testing.expect(seen.contains(r));
+    }
+
+    // --- blobExists: present blob true, never-pushed digest false ---
+    {
+        const ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wexist-{d}", .{ registry, ts }));
+        const data = try a.alloc(u8, 128 * 1024);
+        prng.random().bytes(data);
+        const digest = try c.pushBlob(io, ref, .anonymous, data);
+        try std.testing.expect(try c.blobExists(io, ref, .anonymous, digest));
+        const ghost = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        try std.testing.expect(!try c.blobExists(io, ref, .anonymous, ghost));
+    }
+
+    // --- referrers native path with artifactType filter ---
+    {
+        const man_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wref-{d}:main-{d}", .{ registry, ts, ts }));
+        const cfg_digest = try c.pushBlob(io, man_ref, .anonymous, config_fixture);
+        const layer = try a.alloc(u8, 64 * 1024);
+        prng.random().bytes(layer);
+        const layer_digest = try c.pushBlob(io, man_ref, .anonymous, layer);
+        const man_layers = try a.alloc(manifest.OciDescriptor, 1);
+        man_layers[0] = .{ .media_type = manifest.oci_layer, .digest = layer_digest, .size = layer.len };
+        const man = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest, .size = config_fixture.len },
+            .layers = man_layers,
+        };
+        const main_value = try manifestToValue(a, man);
+        const main_body = try canonical_json.stringify(a, main_value);
+        const main_digest = try canonical_json.digestString(a, main_value);
+        _ = try c.pushManifest(io, man_ref, .anonymous, &.{ .manifest = man });
+        try std.testing.expectEqualStrings(main_digest, try c.fetchManifestDigest(io, man_ref, .anonymous));
+
+        // Referrer: artifact manifest (empty '{}' config, zero layers) with
+        // artifactType + subject = the pushed manifest's digest. Built as a
+        // real OciImageManifest so pushManifest's canonical serialization
+        // (jsonStringify emits artifactType/subject) is what zot hashes.
+        const empty_blob = "{}";
+        const empty_digest = try c.pushBlob(io, man_ref, .anonymous, empty_blob);
+        const ref_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wref-{d}:ref-{d}", .{ registry, ts, ts }));
+        const referrer = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .artifact_type = "application/vnd.example.sbom.v1",
+            .config = .{ .media_type = manifest.oci_config, .digest = empty_digest, .size = empty_blob.len },
+            .layers = &.{},
+            .subject = .{ .media_type = manifest.oci_manifest, .digest = main_digest, .size = main_body.len },
+        };
+        _ = try c.pushManifest(io, ref_ref, .anonymous, &.{ .manifest = referrer });
+        const referrer_digest = try c.fetchManifestDigest(io, ref_ref, .anonymous);
+
+        const digest_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wref-{d}@{s}", .{ registry, ts, main_digest }));
+        const sbom_refs = try c.pullReferrers(io, digest_ref, .anonymous, "application/vnd.example.sbom.v1");
+        try std.testing.expectEqual(@as(usize, 1), sbom_refs.len);
+        try std.testing.expectEqualStrings("application/vnd.example.sbom.v1", sbom_refs[0].artifact_type orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(referrer_digest, sbom_refs[0].digest);
+        // Server-side filter for a media type that is not the referrer's.
+        // Pins zot's SERVER-SIDE artifactType filtering (ci.yml pins zot
+        // v2.1.20). The client's native path does not client-filter (upstream
+        // parity); on a zot upgrade, re-verify server-side filtering before
+        // trusting green.
+        const image_refs = try c.pullReferrers(io, digest_ref, .anonymous, "application/vnd.oci.image.manifest.v1+json");
+        try std.testing.expectEqual(@as(usize, 0), image_refs.len);
+    }
+
+    // --- platform resolution via pull(): index -> linux/amd64 child ---
+    {
+        // The pull() default resolver (linuxAmd64Resolver) is pinned at
+        // client.zig via `orelse`; CI is linux/amd64, so a future default
+        // change would otherwise pass CI silently.
+        try std.testing.expectEqual(@as(?*const fn ([]const manifest.OciDescriptor) ?[]const u8, null), c.config.platform_resolver);
+
+        // Manifest A: linux/amd64 (config_fixture). Manifest B: windows/amd64
+        // (distinct empty config so the resolved config digest is unambiguous).
+        const plat_ref_a = try reference.parse(try std.fmt.allocPrint(a, "{s}/wplat-{d}:a-{d}", .{ registry, ts, ts }));
+        const cfg_digest_a = try c.pushBlob(io, plat_ref_a, .anonymous, config_fixture);
+        const lay_a = try a.alloc(u8, 64 * 1024);
+        prng.random().bytes(lay_a);
+        const lay_a_digest = try c.pushBlob(io, plat_ref_a, .anonymous, lay_a);
+        const man_a_layers = try a.alloc(manifest.OciDescriptor, 1);
+        man_a_layers[0] = .{ .media_type = manifest.oci_layer, .digest = lay_a_digest, .size = lay_a.len };
+        const man_a = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest_a, .size = config_fixture.len },
+            .layers = man_a_layers,
+        };
+        _ = try c.pushManifest(io, plat_ref_a, .anonymous, &.{ .manifest = man_a });
+        const digest_a = try c.fetchManifestDigest(io, plat_ref_a, .anonymous);
+        const body_a = try canonical_json.stringify(a, try manifestToValue(a, man_a));
+
+        const plat_ref_b = try reference.parse(try std.fmt.allocPrint(a, "{s}/wplat-{d}:b-{d}", .{ registry, ts, ts }));
+        const cfg_b = "{}";
+        const cfg_digest_b = try c.pushBlob(io, plat_ref_b, .anonymous, cfg_b);
+        const lay_b = try a.alloc(u8, 64 * 1024);
+        prng.random().bytes(lay_b);
+        const lay_b_digest = try c.pushBlob(io, plat_ref_b, .anonymous, lay_b);
+        const man_b_layers = try a.alloc(manifest.OciDescriptor, 1);
+        man_b_layers[0] = .{ .media_type = manifest.oci_layer, .digest = lay_b_digest, .size = lay_b.len };
+        const man_b = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest_b, .size = cfg_b.len },
+            .layers = man_b_layers,
+        };
+        _ = try c.pushManifest(io, plat_ref_b, .anonymous, &.{ .manifest = man_b });
+        const digest_b = try c.fetchManifestDigest(io, plat_ref_b, .anonymous);
+        const body_b = try canonical_json.stringify(a, try manifestToValue(a, man_b));
+
+        const idx_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wplat-{d}:idx-{d}", .{ registry, ts, ts }));
+        const idx_manifests = try a.alloc(manifest.OciDescriptor, 2);
+        idx_manifests[0] = .{ .media_type = manifest.oci_manifest, .digest = digest_a, .size = body_a.len, .platform = .{ .architecture = "amd64", .os = "linux" } };
+        idx_manifests[1] = .{ .media_type = manifest.oci_manifest, .digest = digest_b, .size = body_b.len, .platform = .{ .architecture = "amd64", .os = "windows" } };
+        const index = manifest.OciImageIndex{
+            .schema_version = 2,
+            .media_type = manifest.oci_index,
+            .manifests = idx_manifests,
+        };
+        _ = try c.pushManifestList(io, idx_ref, .anonymous, &index);
+
+        // Default resolver (linuxAmd64Resolver) must pick manifest A.
+        const accepted = [_][]const u8{ manifest.oci_manifest, manifest.oci_index };
+        const data = try c.pull(io, idx_ref, .anonymous, &accepted);
+        try std.testing.expectEqualStrings(manifest.oci_manifest, data.manifest.mediaType() orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqualStrings(cfg_digest_a, (data.manifest.manifest.config orelse return error.TestUnexpectedResult).digest);
+        try std.testing.expectEqualStrings(lay_a_digest, data.manifest.manifest.layers[0].digest);
+        try std.testing.expectEqualSlices(u8, config_fixture, data.config orelse return error.TestUnexpectedResult);
+    }
+}

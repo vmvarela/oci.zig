@@ -148,8 +148,8 @@ Grouped into delivery tiers — see §12.
 - `Client.mountBlob`
 
 **Tier 3 — admin/misc**
-- `Client.catalog(io, auth, pagination) ![]const []const u8`
-- `Client.blobExists`
+- `Client.catalog(io, image, creds, n: ?usize, last: ?[]const u8) ![]const []const u8`
+- `Client.blobExists(io, image, creds, digest) !bool`
 - `Client.storeAuthIfNeeded`
 
 ## 9. Known risk areas — validate before committing to the full port
@@ -191,7 +191,7 @@ Grouped into delivery tiers — see §12.
 
 - **v0.1** — Tier 1 (read path) complete, unit + integration tests, `zot`-based CI.
 - **v0.2** — Tier 2 (write path) complete, canonical-JSON parity suite finalized.
-- **v0.3** — Tier 3, referrers API polish, platform resolver coverage.
+- **v0.3** — Tier 3 (catalog, blobExists, storeAuthIfNeeded), referrers API polish, platform resolver coverage. (complete)
 - **Post-v1.0 candidate** — evaluate `std.Io.Evented` once non-experimental.
 
 ## 13. Open questions

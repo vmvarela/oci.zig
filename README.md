@@ -16,10 +16,7 @@ See [SPEC.md](SPEC.md) for the full project specification.
 
 ## Status
 
-**v0.2 (in progress)** — Tier 1 read path (auth, manifest/blob pull
-streaming + partial/range, tag listing, referrers, platform resolvers) and
-Tier 2 write path (push manifest/raw/list, push blob monolithic + streamed
-chunked, push convenience wrapper, cross-repo blob mount).
+**v0.3** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists, storeAuthIfNeeded), referrers API with tag-schema fallback, platform resolvers.
 
 ## Requirements
 
@@ -75,6 +72,23 @@ const loc = try client.pushManifestRaw(io.io(), image, auth, manifest_bytes, med
 try client.mountBlob(io.io(), target_image, auth, source_image, digest);
 ```
 
+### Registry admin
+
+```zig
+// Tier 3: list repositories on the registry. Pagination: pass the last
+// returned repository back as `last` on the next call; the response carries
+// no pagination fields.
+const repos = try client.catalog(io.io(), image, auth, 50, last_repo);
+// The returned slice and each repo string are separate allocations — free
+// the slice, then each repo string.
+
+// Blob existence check (HEAD). Returns false when absent, errors otherwise.
+const exists = try client.blobExists(io.io(), image, auth, digest);
+
+// Referrers API, filtered to a specific artifact type (exact match)
+const refs = try client.pullReferrers(io.io(), image, auth, "application/vnd.example.sbom.v1");
+```
+
 ## Development
 
 ```sh
@@ -84,7 +98,9 @@ zig build integration-test  # integration tests against a local zot registry
 
 Integration tests require a running [zot](https://zotregistry.dev/) registry
 at `127.0.0.1:5000` with the test content pushed (see
-`.slim/deepwork/zot/` for the local setup used during development).
+`.slim/deepwork/zot/` for the local setup used during development). Each run
+pushes timestamp-suffixed test repos, so a long-lived local zot accumulates
+them — wipe the zot data directory to reset.
 
 ## License
 
