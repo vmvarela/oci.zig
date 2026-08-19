@@ -196,9 +196,10 @@ Grouped into delivery tiers — see §12.
 
 ## 13. Open questions
 
-- License for `oci.zig`: MIT recommended for ecosystem consistency (matches
-  `oci-spec-zig` and most Zigistry packages) — not yet decided.
-- Module/package name in `build.zig.zon`: proposed `oci`.
+- License for `oci.zig`: **MIT** (decided — `LICENSE` file in place; matches
+  `oci-spec-zig` and most Zigistry packages).
+- Module/package name in `build.zig.zon`: **`oci`** (decided — set in
+  `build.zig.zon`).
 - Whether pure-OCI manifest/descriptor handling should wrap
   `ocispec.image.Descriptor` internally or stay fully independent — decide
   once `manifest.zig` is underway and the Docker-legacy/WASM overlap is
