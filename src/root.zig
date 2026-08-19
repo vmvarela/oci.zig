@@ -1,6 +1,5 @@
 //! oci.zig — pure-Zig OCI Distribution client (reimplementation of
-//! rust-oci-client v0.17.0) on Zig 0.16.0 std only, plus the single
-//! external `ocispec` dependency for OCI image-spec types.
+//! rust-oci-client v0.17.0) on Zig 0.16.0 std only.
 //!
 //! Public module surface. Consumers import submodules either via
 //! `@import("root")` re-exports below or directly by module name.

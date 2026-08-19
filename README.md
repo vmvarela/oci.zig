@@ -21,7 +21,7 @@ See [SPEC.md](SPEC.md) for the full project specification.
 ## Requirements
 
 - Zig 0.16.0 (pinned in `build.zig.zon`)
-- Single dependency: [`ocispec`](https://github.com/navidys/oci-spec-zig) v0.5.0
+- No external dependencies (Zig std only)
 
 ## Usage
 

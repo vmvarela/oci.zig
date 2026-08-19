@@ -3,11 +3,6 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xc674b4972f2f2429,
-    .dependencies = .{
-        .ocispec = .{
-            .url = "https://github.com/navidys/oci-spec-zig/archive/v0.5.0.tar.gz",
-            .hash = "ocispec-0.5.0-voj0caC4AgASnBII8_J_RVbTg6Yw-hRmUYcF4dEHgfEA",
-        },
-    },
+    .dependencies = .{},
     .paths = .{""},
 }

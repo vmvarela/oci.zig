@@ -7,9 +7,6 @@ const std = @import("std");
 /// combined `test` step that runs the std.testing tests of every module
 /// file against the host target.
 pub fn build(b: *std.Build) void {
-    const ocispec = b.dependency("ocispec", .{});
-    const ocispec_mod = ocispec.module("ocispec");
-
     const modules = [_]struct { name: []const u8, src: []const u8 }{
         .{ .name = "root", .src = "src/root.zig" },
         .{ .name = "client", .src = "src/client.zig" },
@@ -38,8 +35,6 @@ pub fn build(b: *std.Build) void {
                 .optimize = .Debug,
             }),
         });
-        // Import is lazy; harmless on modules that never reference it.
-        test_mod.root_module.addImport("ocispec", ocispec_mod);
         // addTest's step only compiles; addRunArtifact actually executes the
         // binary so `zig build test` runs (not just compiles) the tests.
         const run = b.addRunArtifact(test_mod);
@@ -64,7 +59,6 @@ pub fn build(b: *std.Build) void {
     // std.c.getenv (used to read OCI_TEST_REGISTRY) needs libc.
     integration_test.root_module.link_libc = true;
     integration_test.root_module.addImport("oci", b.modules.get("root").?);
-    integration_test.root_module.addImport("ocispec", ocispec_mod);
     // addTest's step only compiles; addRunArtifact actually executes the binary.
     const integration_run = b.addRunArtifact(integration_test);
     const integration_step = b.step("integration-test", "Run integration tests against a running zot registry");

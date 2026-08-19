@@ -40,14 +40,9 @@ pub const ClientProtocol = union(enum) {
     https_except: []const u8,
 };
 
-/// Client configuration. `accept_invalid_certificates` is accepted for API
-/// parity but currently unused: `std.http.Client` has no per-request flag to
-/// disable TLS verification (verification is all-or-nothing via the client's
-/// `ca_bundle`). ponytail: TODO — wire it to a custom `ca_bundle` when needed.
 pub const ClientConfig = struct {
     protocol: ClientProtocol = .https,
     user_agent: []const u8 = "oci.zig/0.1.0",
-    accept_invalid_certificates: bool = false,
     /// Resolves an image index to a single platform manifest digest. Used by
     /// `pull` when the fetched document is an index. Defaults to
     /// `linuxAmd64Resolver`.
@@ -1367,7 +1362,6 @@ test "ClientConfig defaults" {
     const c = ClientConfig{};
     try std.testing.expectEqual(ClientProtocol.https, c.protocol);
     try std.testing.expectEqualStrings("oci.zig/0.1.0", c.user_agent);
-    try std.testing.expectEqual(false, c.accept_invalid_certificates);
     try std.testing.expectEqual(@as(?*const fn ([]const manifest.OciDescriptor) ?[]const u8, null), c.platform_resolver);
 }
 
