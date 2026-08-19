@@ -12,16 +12,12 @@ const Allocator = std.mem.Allocator;
 pub const RegistryOperation = enum {
     pull,
     push,
-    delete,
-    mount,
 
     /// The OCI scope component for this operation ("pull", "push", ...).
     pub fn scopeString(self: RegistryOperation) []const u8 {
         return switch (self) {
             .pull => "pull",
             .push => "push",
-            .delete => "delete",
-            .mount => "mount",
         };
     }
 };
@@ -88,9 +84,8 @@ pub const TokenCache = struct {
 
     /// Stores a token under (registry, repo, op), deriving its expiration
     /// from the JWT `exp` claim (null when not decodable). Expired tokens are
-    /// stored too; `get` drops them. `now_secs` is unused (get filters).
-    pub fn put(self: *TokenCache, registry: []const u8, repo: []const u8, op: RegistryOperation, token: []const u8, now_secs: i64) !void {
-        _ = now_secs;
+    /// stored too; `get` drops them.
+    pub fn put(self: *TokenCache, registry: []const u8, repo: []const u8, op: RegistryOperation, token: []const u8) !void {
         const allocator = self.tokens.allocator;
         const key_str = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ registry, repo, op.scopeString() });
         errdefer allocator.free(key_str);
@@ -138,8 +133,6 @@ test "decodeJwtExp garbage payload errors" {
 test "op scope strings" {
     try std.testing.expectEqualStrings("pull", RegistryOperation.pull.scopeString());
     try std.testing.expectEqualStrings("push", RegistryOperation.push.scopeString());
-    try std.testing.expectEqualStrings("delete", RegistryOperation.delete.scopeString());
-    try std.testing.expectEqualStrings("mount", RegistryOperation.mount.scopeString());
 }
 
 test "token cache get/put round-trip" {
@@ -148,7 +141,7 @@ test "token cache get/put round-trip" {
     defer cache.deinit();
 
     const token = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.sig"; // exp 4102444800 (year 2100)
-    try cache.put("registry.example.com", "org/repo", .pull, token, 0);
+    try cache.put("registry.example.com", "org/repo", .pull, token);
 
     const got = cache.get("registry.example.com", "org/repo", .pull, 1_700_000_000) orelse
         @panic("expected cached token");
@@ -165,7 +158,7 @@ test "expired token dropped by get" {
     defer cache.deinit();
 
     const token = "eyJhbGciOiJub25lIn0.eyJleHAiOjEwMH0.sig"; // exp 100
-    try cache.put("reg", "repo", .pull, token, 0);
+    try cache.put("reg", "repo", .pull, token);
 
     // Before expiry: returned.
     try std.testing.expect(cache.get("reg", "repo", .pull, 50) != null);
@@ -181,7 +174,7 @@ test "token without decodable exp stored as valid" {
     defer cache.deinit();
 
     // Opaque token (no JWT structure): decode fails -> expiration null -> never expires.
-    try cache.put("reg", "repo", .pull, "plain-opaque-token", 0);
+    try cache.put("reg", "repo", .pull, "plain-opaque-token");
     const got = cache.get("reg", "repo", .pull, 9_999_999_999) orelse
         @panic("expected non-expiring token");
     try std.testing.expectEqualStrings("plain-opaque-token", got.token);

@@ -89,11 +89,11 @@ const config_json = @embedFile("fixtures/config.json");
 const manifest_json = @embedFile("fixtures/manifest.json");
 
 /// Minimal `anytype` writer for `format` tests (std.Io has no fixed-buffer writer).
-const TestWriter = struct {
+pub const TestWriter = struct {
     buf: []u8,
     len: usize = 0,
 
-    fn print(self: *TestWriter, comptime fmt: []const u8, args: anytype) !void {
+    pub fn print(self: *TestWriter, comptime fmt: []const u8, args: anytype) !void {
         const s = try std.fmt.bufPrint(self.buf[self.len..], fmt, args);
         self.len += s.len;
     }

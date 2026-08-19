@@ -196,13 +196,5 @@ test "format round-trips" {
     }
 }
 
-/// Minimal `anytype` writer for `format` tests (std.Io has no fixed-buffer writer).
-const TestWriter = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    fn print(self: *TestWriter, comptime fmt: []const u8, args: anytype) !void {
-        const s = try std.fmt.bufPrint(self.buf[self.len..], fmt, args);
-        self.len += s.len;
-    }
-};
+/// Shared with digest.zig's format tests (canonical copy lives there).
+const TestWriter = digest.TestWriter;

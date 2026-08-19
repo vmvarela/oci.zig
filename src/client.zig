@@ -147,7 +147,7 @@ pub const Client = struct {
 
         // Token request: GET realm?service=..&scope=.. with the caller's creds.
         const token = try self.tokenFromChallenge(io, challenge, creds, challenge.scope orelse "") orelse return null;
-        try self.token_cache.put(image.registry, image.repository, op, token, nowUnixSeconds(io));
+        try self.token_cache.put(image.registry, image.repository, op, token);
         return token;
     }
 
@@ -156,23 +156,8 @@ pub const Client = struct {
     /// returned slice and each tag string are separate allocations from the
     /// Client's allocator — free the slice, then each tag.
     pub fn listTags(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, n: ?usize, last: ?[]const u8) ![]const []const u8 {
-        var q = std.ArrayList(u8).empty;
-        defer q.deinit(self.allocator);
-        var first = true;
-        if (n) |count| {
-            const ns = try std.fmt.allocPrint(self.allocator, "n={d}", .{count});
-            defer self.allocator.free(ns);
-            try q.appendSlice(self.allocator, ns);
-            first = false;
-        }
-        if (last) |l| {
-            if (!first) try q.append(self.allocator, '&');
-            try q.appendSlice(self.allocator, "last=");
-            const enc = try percentEncode(self.allocator, l);
-            defer self.allocator.free(enc);
-            try q.appendSlice(self.allocator, enc);
-        }
-        const query: ?[]const u8 = if (q.items.len > 0) q.items else null;
+        const query = try buildPaginationQuery(self.allocator, n, last);
+        defer if (query) |q| self.allocator.free(q);
         const url = try buildUrl(self.allocator, self.config, image, "tags/list", query);
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
@@ -935,7 +920,7 @@ pub const Client = struct {
                 const token = try self.tokenFromChallenge(io, challenge, creds, scope);
                 if (token) |t| {
                     defer self.allocator.free(t);
-                    try self.token_cache.put(image.registry, image.repository, .push, t, nowUnixSeconds(io));
+                    try self.token_cache.put(image.registry, image.repository, .push, t);
                 }
                 // Last statement before continue: req is deinit'd exactly once.
                 container.req.deinit();
@@ -1028,6 +1013,16 @@ const BlobHttp = struct {
     transfer_buf: [64 * 1024]u8 = undefined,
 };
 
+/// Releases the Request, the http.Client, and the container. Captures the
+/// allocator before client.deinit() (which sets client.* to undefined).
+/// Shared by the BlobStreamResult/BlobResponseResult deinit methods.
+fn destroyBlobContainer(req: *std.http.Client.Request, container: *BlobHttp) void {
+    const allocator = container.client.allocator;
+    req.deinit();
+    container.client.deinit();
+    allocator.destroy(container);
+}
+
 /// A full-blob stream plus the owning Request and container. The consumer
 /// reads `stream` to EOF, calls `stream.finish()`, then `deinit()` (which
 /// releases the Request, the http.Client, and the container).
@@ -1037,12 +1032,7 @@ pub const BlobStreamResult = struct {
     container: *BlobHttp,
 
     pub fn deinit(self: *BlobStreamResult) void {
-        // Capture the allocator before client.deinit() (which sets client.*
-        // to undefined).
-        const allocator = self.container.client.allocator;
-        self.req.deinit();
-        self.container.client.deinit();
-        allocator.destroy(self.container);
+        destroyBlobContainer(self.req, self.container);
     }
 };
 
@@ -1054,10 +1044,7 @@ pub const BlobResponseResult = struct {
     container: *BlobHttp,
 
     pub fn deinit(self: *BlobResponseResult) void {
-        const allocator = self.container.client.allocator;
-        self.req.deinit();
-        self.container.client.deinit();
-        allocator.destroy(self.container);
+        destroyBlobContainer(self.req, self.container);
     }
 };
 
@@ -1153,11 +1140,10 @@ fn buildUrl(allocator: Allocator, config: ClientConfig, image: reference.Referen
     return std.fmt.allocPrint(allocator, "{s}://{s}/v2/{s}/{s}", .{ scheme, image.registry, image.repository, path });
 }
 
-/// Builds "<scheme>://<registry>/v2/_catalog[?n=<n>[&last=<encoded>]]" —
-/// registry-scoped, no repository segment. `n` and `last` are appended only
-/// when present.
-fn catalogUrl(allocator: Allocator, config: ClientConfig, image: reference.Reference, n: ?usize, last: ?[]const u8) ![]u8 {
-    const scheme = config.scheme(image.registry);
+/// Builds the "n=<n>[&last=<encoded>]" query fragment shared by listTags and
+/// catalogUrl. Returns null when both `n` and `last` are absent; `last` is
+/// percent-encoded. The result is an owned allocation (free with `allocator`).
+fn buildPaginationQuery(allocator: Allocator, n: ?usize, last: ?[]const u8) !?[]const u8 {
     var q = std.ArrayList(u8).empty;
     defer q.deinit(allocator);
     var first = true;
@@ -1174,8 +1160,19 @@ fn catalogUrl(allocator: Allocator, config: ClientConfig, image: reference.Refer
         defer allocator.free(enc);
         try q.appendSlice(allocator, enc);
     }
-    if (q.items.len > 0) {
-        return std.fmt.allocPrint(allocator, "{s}://{s}/v2/_catalog?{s}", .{ scheme, image.registry, q.items });
+    if (q.items.len == 0) return null;
+    return try allocator.dupe(u8, q.items);
+}
+
+/// Builds "<scheme>://<registry>/v2/_catalog[?n=<n>[&last=<encoded>]]" —
+/// registry-scoped, no repository segment. `n` and `last` are appended only
+/// when present.
+fn catalogUrl(allocator: Allocator, config: ClientConfig, image: reference.Reference, n: ?usize, last: ?[]const u8) ![]u8 {
+    const scheme = config.scheme(image.registry);
+    const query = try buildPaginationQuery(allocator, n, last);
+    defer if (query) |q| allocator.free(q);
+    if (query) |q| {
+        return std.fmt.allocPrint(allocator, "{s}://{s}/v2/_catalog?{s}", .{ scheme, image.registry, q });
     }
     return std.fmt.allocPrint(allocator, "{s}://{s}/v2/_catalog", .{ scheme, image.registry });
 }
