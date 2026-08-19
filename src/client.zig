@@ -452,17 +452,6 @@ pub const Client = struct {
         return indexDescriptors(self.allocator, result.body);
     }
 
-    /// Returns the bearer token for `image`/`op` (from the cache when fresh,
-    /// otherwise via the auth flow), or null when no auth is needed. Internal
-    /// token-cache helper, exposed for callers that want to pre-authenticate.
-    pub fn storeAuthIfNeeded(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation) !?[]const u8 {
-        const now = nowUnixSeconds(io);
-        if (self.token_cache.get(image.registry, image.repository, op, now)) |t| {
-            return try self.allocator.dupe(u8, t.token);
-        }
-        return self.auth(io, image, creds, op);
-    }
-
     /// Pushes `data` as a complete blob in a single monolithic PUT
     /// (Oracle 1). Returns the allocated "sha256:<hex>" digest.
     pub fn pushBlob(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, data: []const u8) ![]const u8 {

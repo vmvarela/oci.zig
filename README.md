@@ -16,7 +16,7 @@ See [SPEC.md](SPEC.md) for the full project specification.
 
 ## Status
 
-**v0.3** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists, storeAuthIfNeeded), referrers API with tag-schema fallback, platform resolvers.
+**v0.3** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists), referrers API with tag-schema fallback, platform resolvers.
 
 ## Requirements
 
