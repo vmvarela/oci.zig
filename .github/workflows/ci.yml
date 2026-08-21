@@ -14,9 +14,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
-          zig-version: 0.16.0
+          version: 0.16.0
       - name: Build and test
         run: zig build test
 
@@ -24,9 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
-          zig-version: 0.16.0
+          version: 0.16.0
       - name: Download zot
         run: |
           curl -sfL -o zot https://github.com/project-zot/zot/releases/download/v2.1.20/zot-linux-amd64
