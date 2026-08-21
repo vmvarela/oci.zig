@@ -4,5 +4,13 @@
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xc674b4972f2f2429,
     .dependencies = .{},
-    .paths = .{""},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests/fixtures",
+        "LICENSE",
+        "README.md",
+        "SPEC.md",
+    },
 }
