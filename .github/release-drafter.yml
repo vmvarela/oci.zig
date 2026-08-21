@@ -1,0 +1,90 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
+
+autolabeler:
+  - label: "type:feature"
+    title:
+      - "/^feat(\\(.+\\))?:/i"
+  - label: "type:bug"
+    title:
+      - "/^fix(\\(.+\\))?:/i"
+  - label: "type:chore"
+    title:
+      - "/^chore(\\(.+\\))?:/i"
+      - "/^ci(\\(.+\\))?:/i"
+      - "/^test(\\(.+\\))?:/i"
+      - "/^refactor(\\(.+\\))?:/i"
+      - "/^build(\\(.+\\))?:/i"
+  - label: "type:docs"
+    title:
+      - "/^docs(\\(.+\\))?:/i"
+
+categories:
+  - title: "🚀 Features"
+    labels:
+      - "type:feature"
+    exclude-labels:
+      - "type:bug"
+      - "type:chore"
+      - "type:docs"
+      - "type:spike"
+      - "dependencies"
+  - title: "🐛 Bug Fixes"
+    labels:
+      - "type:bug"
+    exclude-labels:
+      - "type:feature"
+      - "type:chore"
+      - "type:docs"
+      - "type:spike"
+      - "dependencies"
+  - title: "🧰 Maintenance"
+    labels:
+      - "type:chore"
+      - "tech-debt"
+    exclude-labels:
+      - "type:feature"
+      - "type:bug"
+      - "type:docs"
+      - "type:spike"
+      - "dependencies"
+  - title: "📝 Documentation"
+    labels:
+      - "type:docs"
+    exclude-labels:
+      - "type:feature"
+      - "type:bug"
+      - "type:chore"
+      - "type:spike"
+      - "dependencies"
+  - title: "🔬 Spikes & Research"
+    labels:
+      - "type:spike"
+    exclude-labels:
+      - "dependencies"
+  - title: "⬆️ Dependency Updates"
+    labels:
+      - "dependencies"
+
+change-template: "- $TITLE (#$NUMBER) @$AUTHOR"
+change-title-escapes: '\<*_&'
+
+version-resolver:
+  major:
+    labels:
+      - "type:breaking"
+  minor:
+    labels:
+      - "type:feature"
+  patch:
+    labels:
+      - "type:bug"
+      - "type:chore"
+      - "type:docs"
+  default: patch

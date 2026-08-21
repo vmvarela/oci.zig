@@ -1,0 +1,8 @@
+# Label configuration — informational only.
+# Type labels (type:feature, type:bug, type:chore, type:docs) are applied by
+# the labeler workflow via github-script, matching the PR title against
+# Conventional Commits prefixes (feat:, fix:, chore:, docs:, etc.).
+#
+# File-based and branch-based rules are intentionally omitted:
+#   - File-based rules cause multiple type:* labels per PR → duplicate release notes.
+#   - Branch names follow issue-N/description, not feat/fix/... prefixes.
