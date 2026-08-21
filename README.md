@@ -16,7 +16,7 @@ See [SPEC.md](SPEC.md) for the full project specification.
 
 ## Status
 
-**v0.4** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists), referrers API with tag-schema fallback, platform resolvers. Zero external dependencies (dropped `ocispec`); dead public API removed (`validateDigest`, `digestHeaderValue`, `storeAuthIfNeeded`).
+**v0.4** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists), referrers API with tag-schema fallback, platform resolvers. Zero external dependencies (dropped `ocispec`); dead public API removed (`validateDigest`, `digestHeaderValue`, `storeAuthIfNeeded`); TLS certificate support (custom root CAs via `extra_root_certificates` / `tls_certs_only`).
 
 ## Requirements
 
@@ -89,6 +89,26 @@ const exists = try client.blobExists(io.io(), image, auth, digest);
 const refs = try client.pullReferrers(io.io(), image, auth, "application/vnd.example.sbom.v1");
 ```
 
+### Custom TLS certificates
+
+Private registries with self-signed or private-CA certificates:
+
+```zig
+// ca_pem_bytes: PEM bytes of the CA certificate (caller-owned).
+// .fromDer(der_bytes) also works for DER-encoded certificates.
+var ca_certs = [_]oci.tls.Certificate{oci.tls.Certificate.fromPem(ca_pem_bytes)};
+
+var client = oci.client.Client.init(gpa.allocator(), .{
+    .protocol = .https,
+    .extra_root_certificates = &ca_certs, // trust these in addition to system roots
+    // .tls_certs_only = &ca_certs,       // trust ONLY these, no system roots
+});
+```
+
+`accept_invalid_certificates` / `accept_invalid_hostnames` are NOT supported
+(Zig's `std.http.Client` has no hook to disable verification). Workaround: use
+`.protocol = .http` or a TLS-terminating reverse proxy.
+
 ## Development
 
 ```sh
@@ -97,10 +117,10 @@ zig build integration-test  # integration tests against a local zot registry
 ```
 
 Integration tests require a running [zot](https://zotregistry.dev/) registry
-at `127.0.0.1:5000` with the test content pushed (see
-`.slim/deepwork/zot/` for the local setup used during development). Each run
-pushes timestamp-suffixed test repos, so a long-lived local zot accumulates
-them — wipe the zot data directory to reset.
+at `127.0.0.1:5000` with the test content pushed via `tests/setup.sh` (see
+that script for the setup). Each run pushes timestamp-suffixed test repos, so
+a long-lived local zot accumulates them — wipe the zot data directory to
+reset.
 
 ## License
 

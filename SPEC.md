@@ -199,7 +199,8 @@ types arises, revisit `oci-spec-zig` as a normal dependency (`zig fetch
 - **v0.3** — Tier 3 (catalog, blobExists, storeAuthIfNeeded), referrers API polish, platform resolver coverage. (complete)
 - **v0.4** — breaking cleanup on the 0.1.0 lib: drop the never-imported
   `ocispec` dependency, remove dead public API (`validateDigest`,
-  `digestHeaderValue`, `storeAuthIfNeeded`), internal shrink. (complete)
+  `digestHeaderValue`, `storeAuthIfNeeded`), internal shrink; TLS certificate
+  support (custom root CAs via `extra_root_certificates` / `tls_certs_only`). (complete)
 - **Post-v1.0 candidate** — evaluate `std.Io.Evented` once non-experimental.
 
 ## 13. Open questions
