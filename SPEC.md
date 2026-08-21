@@ -1,6 +1,9 @@
 # oci.zig — Project Specification
 
-Status: draft / pre-implementation. No stable API yet.
+Status: **v0.4** — all three delivery tiers implemented, zero external
+dependencies, zot-based CI. v0.4 was a breaking cleanup pass on the 0.1.0
+lib: dropped the never-imported `ocispec` dependency and removed dead public
+API (`validateDigest`, `digestHeaderValue`, `storeAuthIfNeeded`).
 
 ## 1. Overview
 
@@ -43,9 +46,9 @@ belongs in a separate package on top of `oci.zig`, not inside it.
   Zig std only.
 - Correctness parity with `rust-oci-client` where it matters most: canonical
   JSON manifest digests, auth token handling, error semantics.
-- Reuse existing, well-scoped Zig libraries for spec-level types instead of
-  redefining them (see §5) — but don't force a dependency where its scope
-  doesn't actually match what the client needs (also §5).
+- Zero external dependencies. Transport, TLS, JSON, hashing, and spec-level
+  types all come from Zig std or this crate. `oci-spec-zig` was evaluated
+  (see §5) but dropped in v0.4 — no source file ever imported it (see §11).
 
 ## 4. Non-goals (for now)
 
@@ -67,6 +70,10 @@ the `oci-spec` crate, **not** of `oci-client`). Two dependencies declared in
 `rust-oci-client`'s `Cargo.toml` (`regex`, `unicase`) turned out to have zero
 actual usage in `src/*.rs` — dropped, no Zig equivalent needed.
 
+**Outcome (v0.4):** the `ocispec` dependency was dropped entirely — no source
+file ever imported it. Everything below is now written from scratch in this
+crate, std-only. The table records the original plan and the final call.
+
 | Concern | Rust source | oci.zig plan | Notes |
 |---|---|---|---|
 | HTTP/1.1 transport + TLS | `reqwest` + `rustls` | `std.http.Client` + `std.crypto.tls` | Std only. Validate streaming/range-request behavior early — see §9. |
@@ -74,8 +81,8 @@ actual usage in `src/*.rs` — dropped, no Zig equivalent needed.
 | JSON (de)serialization | `serde`/`serde_json` | `std.json` | |
 | SHA-256/384/512 | `sha2` | `std.crypto.hash.sha2` | |
 | Hex encoding | `hex` | `std.fmt` | |
-| OCI Image Configuration (`config.rs`: `ConfigFile`, `Config`, `Rootfs`, `History`) | own types, `type Architecture = oci_spec::image::Arch` | **fully covered by `ocispec.image.ImageConfiguration` / `Config` / `RootFS` / `History`** | Verified field-for-field. No `oci.zig`-specific file needed here — just consume `ocispec.image.*` directly. |
-| Well-known annotation keys (`annotations.rs`) | `ORG_OPENCONTAINERS_IMAGE_*` consts | **`ocispec.image` annotation constants** | Verified identical key strings (`org.opencontainers.image.*`), just a different naming convention (`ANNOTATION_CREATED` vs `ORG_OPENCONTAINERS_IMAGE_CREATED`). Reuse. |
+| OCI Image Configuration (`config.rs`: `ConfigFile`, `Config`, `Rootfs`, `History`) | own types, `type Architecture = oci_spec::image::Arch` | **raw config bytes** | Originally planned to consume `ocispec.image.*`; v0.4 dropped the dep. `pullManifestAndConfig` returns the config blob as raw bytes — no typed `ConfigFile` shipped. |
+| Well-known annotation keys (`annotations.rs`) | `ORG_OPENCONTAINERS_IMAGE_*` consts | **write from scratch** (`manifest.zig`) | Originally planned to reuse `ocispec.image` annotation constants; v0.4 dropped the dep. `manifest.zig` carries `annotations` as `json.ArrayHashMap([]const u8)` — no named constants needed. |
 | Manifest/Index/Descriptor/Platform types + media-type constants (`manifest.rs`) | `OciManifest`, `OciImageManifest`, `OciImageIndex`, `OciDescriptor`, `Platform`, plus Docker-legacy (`application/vnd.docker.distribution.manifest.v2+json`) and WASM media type constants | **write from scratch** (`manifest.zig`) | `ocispec.image.MediaType` is pure-OCI only — verified it has no Docker Distribution v2 schema2 or WASM variants. `rust-oci-client` deliberately supports those for compatibility with real-world registries and OCI-artifact use cases. Internally it can still lean on `ocispec.image.Descriptor` for the pure-OCI cases, but the manifest/index union type and legacy media types need their own home. |
 | Blob transport plumbing (`blob.rs`: `SizedStream`, `BlobResponse`) | internal | **write from scratch** (`blob.zig`) | Pure client plumbing, not spec-related. |
 | Digest header handling + validation (`digest.rs`: `Digest<'a>`, `digest_header_value`, `validate_digest`) | internal | **write from scratch** (`digest.zig`) | Distinct from `ocispec`'s `Digest` (which only parses/formats the `algo:hex` string). This is the `Docker-Content-Digest` header extraction plus verifying a pulled blob's actual hash against the expected digest. |
@@ -118,10 +125,9 @@ src/
   token_cache.zig                 // RegistryToken, TokenCache, RegistryOperation
 ```
 
-Single external dependency: `ocispec` ([oci-spec-zig](https://github.com/navidys/oci-spec-zig)),
-imported for `image.ImageConfiguration`/`Config`/`RootFS`/`History` and
-`image` annotation constants, and `distribution.RepositoryList`/`TagList`.
-Not the `runtime` submodule (irrelevant here).
+Zero external dependencies. `ocispec` was evaluated and dropped in v0.4
+(never imported); `image` config/annotation types are reimplemented
+independently in `manifest.zig`.
 
 ## 8. Public API surface (ported from `client.rs`)
 
@@ -150,7 +156,6 @@ Grouped into delivery tiers — see §12.
 **Tier 3 — admin/misc**
 - `Client.catalog(io, image, creds, n: ?usize, last: ?[]const u8) ![]const []const u8`
 - `Client.blobExists(io, image, creds, digest) !bool`
-- `Client.storeAuthIfNeeded`
 
 ## 9. Known risk areas — validate before committing to the full port
 
@@ -180,18 +185,21 @@ Grouped into delivery tiers — see §12.
 
 ## 11. Relationship to oci-spec-zig
 
-- Consume it as a normal dependency (`zig fetch --save`), not a fork.
-- If a concrete gap blocks development (missing type, bug), open an
-  issue/PR upstream first — the project has `CONTRIBUTING.md` and
-  `MAINTAINERS.md`, and was last active 2026-06.
-- Fork only as a last resort, if upstream is unresponsive or declines a
-  needed change — and prefer contributing back over diverging silently.
+Evaluated as a dependency, then dropped in v0.4 — no source file ever
+imported it. The `image` config/annotation types it would have provided are
+reimplemented independently in `manifest.zig` (config handled as raw bytes,
+annotations as `json.ArrayHashMap`). If a future need for typed image-config
+types arises, revisit `oci-spec-zig` as a normal dependency (`zig fetch
+--save`), not a fork.
 
 ## 12. Roadmap
 
 - **v0.1** — Tier 1 (read path) complete, unit + integration tests, `zot`-based CI.
 - **v0.2** — Tier 2 (write path) complete, canonical-JSON parity suite finalized.
 - **v0.3** — Tier 3 (catalog, blobExists, storeAuthIfNeeded), referrers API polish, platform resolver coverage. (complete)
+- **v0.4** — breaking cleanup on the 0.1.0 lib: drop the never-imported
+  `ocispec` dependency, remove dead public API (`validateDigest`,
+  `digestHeaderValue`, `storeAuthIfNeeded`), internal shrink. (complete)
 - **Post-v1.0 candidate** — evaluate `std.Io.Evented` once non-experimental.
 
 ## 13. Open questions
@@ -201,7 +209,7 @@ Grouped into delivery tiers — see §12.
 - Module/package name in `build.zig.zon`: **`oci`** (decided — set in
   `build.zig.zon`).
 - Whether pure-OCI manifest/descriptor handling should wrap
-  `ocispec.image.Descriptor` internally or stay fully independent — decide
-  once `manifest.zig` is underway and the Docker-legacy/WASM overlap is
-  clearer in practice.
+  `ocispec.image.Descriptor` internally or stay fully independent — **decided
+  (v0.4): fully independent.** The `ocispec` dependency was dropped; `manifest.zig`
+  defines its own string-media-type descriptors with no wrapping.
 

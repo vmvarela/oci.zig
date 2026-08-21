@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// oci.zig — pure-Zig OCI Distribution client.
 ///
-/// Builds and registers all 11 public modules in the `oci` package
+/// Builds and registers all 12 public modules in the `oci` package
 /// (consumers: `b.dependency("oci", .{}).module("<name>")`), plus a
 /// combined `test` step that runs the std.testing tests of every module
 /// file against the host target.
@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "errors", .src = "src/errors.zig" },
         .{ .name = "secrets", .src = "src/secrets.zig" },
         .{ .name = "token_cache", .src = "src/token_cache.zig" },
+        .{ .name = "tls", .src = "src/tls.zig" },
     };
 
     for (modules) |m| {

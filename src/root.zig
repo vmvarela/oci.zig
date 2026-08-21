@@ -13,6 +13,7 @@ pub const token_cache = @import("token_cache.zig");
 pub const canonical_json = @import("canonical_json.zig");
 pub const manifest = @import("manifest.zig");
 pub const blob = @import("blob.zig");
+pub const tls = @import("tls.zig");
 pub const client = @import("client.zig");
 
 test {

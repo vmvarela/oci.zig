@@ -6,6 +6,11 @@
 //! manifests are `manifest.OciManifest`, digests are strings, credentials are
 //! `secrets.RegistryAuth`, references are `reference.Reference`.
 //!
+//! TLS certificate customization (extra root CAs / certs-only mode) is
+//! configured via `ClientConfig.extra_root_certificates` /
+//! `ClientConfig.tls_certs_only`; each fresh `std.http.Client` gets the
+//! configured CA bundle applied to its `ca_bundle`.
+//!
 //! Error semantics (from `errors.OciError`): 404 -> `error.NotFound`,
 //! 403 -> `error.Forbidden`, other non-2xx -> `error.UnexpectedStatus`,
 //! 401 after the token flow -> `error.Unauthorized`.
@@ -26,6 +31,7 @@ const token_cache = @import("token_cache.zig");
 const manifest = @import("manifest.zig");
 const blob = @import("blob.zig");
 const canonical_json = @import("canonical_json.zig");
+const tls = @import("tls.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -42,11 +48,25 @@ pub const ClientProtocol = union(enum) {
 
 pub const ClientConfig = struct {
     protocol: ClientProtocol = .https,
-    user_agent: []const u8 = "oci.zig/0.1.0",
+    user_agent: []const u8 = "oci.zig/0.4.0",
     /// Resolves an image index to a single platform manifest digest. Used by
     /// `pull` when the fetched document is an index. Defaults to
     /// `linuxAmd64Resolver`.
     platform_resolver: ?*const fn ([]const manifest.OciDescriptor) ?[]const u8 = null,
+
+    /// Extra root CA certificates to trust, in addition to the system roots.
+    /// `data` slices must outlive the Client (borrowed, like user_agent).
+    extra_root_certificates: []tls.Certificate = &[_]tls.Certificate{},
+    /// Use ONLY these root CA certificates (system roots are NOT loaded).
+    /// For private/air-gapped CAs. `data` slices must outlive the Client.
+    /// When both this and `extra_root_certificates` are set, this field takes
+    /// precedence.
+    tls_certs_only: []tls.Certificate = &[_]tls.Certificate{},
+
+    /// NOTE: `accept_invalid_certificates` and `accept_invalid_hostnames` are
+    /// NOT supported. Zig's std.http.Client hardcodes hostname verification
+    /// and has no hook to disable certificate verification. Workaround: use
+    /// the `.http` protocol or a TLS-terminating reverse proxy.
 
     /// Effective scheme for `registry` (https unless excepted).
     pub fn scheme(self: ClientConfig, registry: []const u8) []const u8 {
@@ -97,6 +117,48 @@ pub const Client = struct {
         self.token_cache.deinit();
     }
 
+    /// Creates a fresh std.http.Client with the configured TLS certificate
+    /// settings applied to its CA bundle.
+    fn newHttpClient(self: *Client, io: Io) !std.http.Client {
+        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        try self.applyTlsConfig(io, &http);
+        return http;
+    }
+
+    /// Applies extra_root_certificates / tls_certs_only to `http`'s CA bundle.
+    /// No-op when neither is configured. Sets `http.now` so the lazy system-root
+    /// rescan (which would wipe custom certs) never runs.
+    fn applyTlsConfig(self: *Client, io: Io, http: *std.http.Client) !void {
+        if (self.config.extra_root_certificates.len == 0 and self.config.tls_certs_only.len == 0) return;
+
+        try http.ca_bundle_lock.lock(io);
+        defer http.ca_bundle_lock.unlock(io);
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(self.allocator);
+
+        const now = Io.Clock.real.now(io);
+        if (self.config.tls_certs_only.len == 0) {
+            try bundle.rescan(self.allocator, io, now);
+        }
+        const start_len = bundle.bytes.items.len;
+
+        const certs = if (self.config.tls_certs_only.len > 0)
+            self.config.tls_certs_only
+        else
+            self.config.extra_root_certificates;
+        for (certs) |cert| {
+            try addCertToBundle(self.allocator, &bundle, cert, std.Io.Timestamp.toSeconds(now));
+        }
+
+        // If every custom cert was silently dropped (expired/unparseable), fail
+        // loudly instead of confusingly failing TLS verification later.
+        if (certs.len > 0 and bundle.bytes.items.len == start_len) return error.InvalidCertificate;
+
+        http.now = now; // prevent lazy rescan from wiping custom certs
+        std.mem.swap(std.crypto.Certificate.Bundle, &http.ca_bundle, &bundle);
+    }
+
     /// Resolves a bearer token for `image`/`op`, or null when the registry
     /// needs no authentication. Probes the image's manifest URL; on 401 it
     /// parses the `WWW-Authenticate` Bearer challenge, requests a token from
@@ -114,7 +176,7 @@ pub const Client = struct {
         defer self.allocator.free(url);
         const uri = try std.Uri.parse(url);
 
-        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        var http = try self.newHttpClient(io);
         defer http.deinit();
         var redirect_buf: [8192]u8 = undefined;
 
@@ -222,7 +284,7 @@ pub const Client = struct {
     /// Returns true on success, false on 404. `.forbidden` -> error.Forbidden,
     /// other non-success statuses -> error.UnexpectedStatus. No body is read.
     fn headRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation, uri: std.Uri) !bool {
-        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        var http = try self.newHttpClient(io);
         defer http.deinit();
         var redirect_buf: [8192]u8 = undefined;
 
@@ -694,7 +756,7 @@ pub const Client = struct {
     /// Returns the body plus copied `Docker-Content-Digest` / `Content-Range`
     /// headers (owned by the caller via `GetResult.deinit`).
     fn getBody(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation, uri: std.Uri, headers: []const std.http.Header) !GetResult {
-        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        var http = try self.newHttpClient(io);
         defer http.deinit();
         var redirect_buf: [8192]u8 = undefined;
 
@@ -766,11 +828,13 @@ pub const Client = struct {
         const uri = try std.Uri.parse(url);
 
         const container = try self.allocator.create(BlobHttp);
-        container.* = .{ .client = .{ .allocator = self.allocator, .io = io }, .req = undefined };
+        var client_ready = false;
         errdefer {
-            container.client.deinit();
+            if (client_ready) container.client.deinit();
             self.allocator.destroy(container);
         }
+        container.* = .{ .client = try self.newHttpClient(io), .req = undefined };
+        client_ready = true;
 
         var headers: [1]std.http.Header = undefined;
         var headers_len: usize = 0;
@@ -795,9 +859,10 @@ pub const Client = struct {
             const status = resp.head.status;
 
             if (status == .unauthorized and attempts == 0) {
-                container.req.deinit();
                 const token = try self.auth(io, image, .anonymous, .pull);
                 if (token) |t| self.allocator.free(t);
+                // Last statement before continue: req is deinit'd exactly once.
+                container.req.deinit();
                 continue;
             }
 
@@ -827,7 +892,7 @@ pub const Client = struct {
         const auth_value = try secrets.basicAuthHeader(creds, self.allocator);
         defer if (auth_value) |v| self.allocator.free(v);
 
-        var http: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        var http = try self.newHttpClient(io);
         defer http.deinit();
         var redirect_buf: [8192]u8 = undefined;
         var req = try http.request(.GET, token_uri, .{
@@ -866,11 +931,13 @@ pub const Client = struct {
     /// client.deinit() + destroy (see WriteHttp).
     fn writeRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, extra_headers: []const std.http.Header, body: []u8) !WriteAttempt {
         const container = try self.allocator.create(WriteHttp);
-        container.* = .{ .client = .{ .allocator = self.allocator, .io = io }, .req = undefined };
+        var client_ready = false;
         errdefer {
-            container.client.deinit();
+            if (client_ready) container.client.deinit();
             self.allocator.destroy(container);
         }
+        container.* = .{ .client = try self.newHttpClient(io), .req = undefined };
+        client_ready = true;
 
         var attempts: usize = 0;
         while (attempts < 2) : (attempts += 1) {
@@ -1215,6 +1282,39 @@ fn sha256DigestString(allocator: Allocator, bytes: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
 }
 
+/// Adds one certificate to the bundle. PEM is converted to DER in memory;
+/// DER is appended directly. `parseCert` validates and silently drops
+/// expired/unparseable certs (bundle.bytes is truncated back).
+fn addCertToBundle(allocator: Allocator, bundle: *std.crypto.Certificate.Bundle, cert: tls.Certificate, now_sec: i64) !void {
+    const der = switch (cert.encoding) {
+        .der => cert.data,
+        .pem => try pemToDer(allocator, cert.data),
+    };
+    defer if (cert.encoding == .pem) allocator.free(der);
+
+    const decoded_start: u32 = @intCast(bundle.bytes.items.len);
+    try bundle.bytes.appendSlice(allocator, der);
+    try bundle.parseCert(allocator, decoded_start, now_sec);
+}
+
+/// Converts a PEM certificate (BEGIN/END CERTIFICATE markers) to DER bytes.
+/// Multi-certificate PEM chains are rejected (only a single cert is expected).
+fn pemToDer(allocator: Allocator, pem: []const u8) ![]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    const begin_start = std.mem.indexOf(u8, pem, begin) orelse return error.InvalidCertificate;
+    const after_begin = begin_start + begin.len;
+    const end_rel = std.mem.indexOf(u8, pem[after_begin..], end) orelse return error.InvalidCertificate;
+    // Fail loudly on a chain file rather than silently truncate trust material.
+    if (std.mem.indexOf(u8, pem[after_begin + end_rel ..], begin) != null) return error.InvalidCertificate;
+    const encoded = std.mem.trim(u8, pem[after_begin .. after_begin + end_rel], " \t\r\n");
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const der = try allocator.alloc(u8, decoder.calcSizeUpperBound(encoded.len));
+    errdefer allocator.free(der);
+    const n = decoder.decode(der, encoded) catch return error.InvalidCertificate;
+    return allocator.realloc(der, n);
+}
+
 /// Manifest reference for push: tag if set, else digest, else "latest".
 fn manifestRef(allocator: Allocator, image: reference.Reference) ![]u8 {
     if (image.tag) |t| return allocator.dupe(u8, t);
@@ -1347,7 +1447,7 @@ fn resolvePlatform(descriptors: []const manifest.OciDescriptor, arch: []const u8
 test "ClientConfig defaults" {
     const c = ClientConfig{};
     try std.testing.expectEqual(ClientProtocol.https, c.protocol);
-    try std.testing.expectEqualStrings("oci.zig/0.1.0", c.user_agent);
+    try std.testing.expectEqualStrings("oci.zig/0.4.0", c.user_agent);
     try std.testing.expectEqual(@as(?*const fn ([]const manifest.OciDescriptor) ?[]const u8, null), c.platform_resolver);
 }
 
@@ -1608,4 +1708,105 @@ test "manifestCanonicalBytes digest matches the canonical body" {
     const canonical = try canonical_json.stringify(a, parsed.value);
     defer a.free(canonical);
     try std.testing.expectEqualStrings(canonical, body);
+}
+
+// Self-signed cert for localhost (openssl req -x509 -newkey rsa:2048 ...).
+// Expires 2027-08-21 — regenerate before then (parseCert drops expired certs).
+const test_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIDCTCCAfGgAwIBAgIUFoH0pd4IrEdG8/1BbCVocZ2uYX0wDQYJKoZIhvcNAQEL
+    \\BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgyMTExMTAyNVoXDTI3MDgy
+    \\MTExMTAyNVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+    \\AAOCAQ8AMIIBCgKCAQEAsMV9kjyDPxJo5PRxsu2YZPs3dEs7CEHIbsbK44vcGuQO
+    \\mb10itC5QflBkBUY/5PkqAfQgOvyztC2lY3aKltAF4YUzzEpXWsQQMzjzHiA/kqd
+    \\+EViczIuFX6FpSUSE4CklHe+BlCTkybQRkncg0T61jQmb/NlYU9S2JAJwyctk/Is
+    \\5wDGIY7D1WUfvwO7hxgbCi0FzRB5DvL6eDL65JO5diLWzbEDde/tlm1x4V1WoNGJ
+    \\vb+QJKsSOcLNWImeWE/aJ9keu42K7XtsjbDJb2TICx7dAZURFfFhkwZp4ImblN5n
+    \\MgiCqci+0t2I76QreBLYOCrgxA1oQHi9XhlBwWvkxwIDAQABo1MwUTAdBgNVHQ4E
+    \\FgQUSjEKOhPcOCmf+RkI8JIhdcB9Go8wHwYDVR0jBBgwFoAUSjEKOhPcOCmf+RkI
+    \\8JIhdcB9Go8wDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAeO6q
+    \\/tI4dMwRhSx95uv1YdtiH7kBaJQFd4dlTS4QMedjRO/4EHTWMtq9yTfhnJfxAODk
+    \\99Q8j6Z5ONIuGBDyI/cblsP7JvZuXLsqTiUqk3+WwBemRfp15OqJdPXlyscSGnNq
+    \\Tw55UOtDom4ItlEVih0RKL+ksw+14aYKwbjDdUl1EnDWvvqHR4MlB17m9iuW//7v
+    \\VdZJ6CeeGoFe4CnZUf7iuyuA7XwlD/T3A474lmQUXu/s1SdJDxsmvfwUczyRSK9H
+    \\nL5fKASRuwyQ8TcxvAhzaLLBNlAFg7OAFPk6WRmWhlKg5b5usyoZvwf7j7CDMFts
+    \\P5lXGMTaYP8E7I1/fg==
+    \\-----END CERTIFICATE-----
+;
+
+test "pemToDer decodes to a non-empty DER SEQUENCE" {
+    const a = std.testing.allocator;
+    const der = try pemToDer(a, test_pem);
+    defer a.free(der);
+    try std.testing.expect(der.len > 0);
+    try std.testing.expectEqual(@as(u8, 0x30), der[0]); // ASN.1 SEQUENCE
+}
+
+test "applyTlsConfig accepts a valid PEM cert into the CA bundle" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var certs = [_]tls.Certificate{tls.Certificate.fromPem(test_pem)};
+    var client = Client.init(a, .{ .protocol = .http, .tls_certs_only = &certs });
+    defer client.deinit();
+    var http = try client.newHttpClient(io.io());
+    defer http.deinit();
+    try std.testing.expect(http.ca_bundle.bytes.items.len > 0);
+}
+
+test "applyTlsConfig rejects garbage PEM" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var certs = [_]tls.Certificate{tls.Certificate.fromPem("not a certificate")};
+    var client = Client.init(a, .{ .protocol = .http, .tls_certs_only = &certs });
+    defer client.deinit();
+    try std.testing.expectError(error.InvalidCertificate, client.newHttpClient(io.io()));
+}
+
+test "no TLS config leaves ca_bundle empty and now null" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var client = Client.init(a, .{ .protocol = .http });
+    defer client.deinit();
+    var http = try client.newHttpClient(io.io());
+    defer http.deinit();
+    try std.testing.expectEqual(@as(?std.Io.Timestamp, null), http.now);
+    try std.testing.expectEqual(@as(usize, 0), http.ca_bundle.bytes.items.len);
+}
+
+test "addCertToBundle drops an expired cert (bundle stays empty)" {
+    const a = std.testing.allocator;
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(a);
+    const cert = tls.Certificate.fromPem(test_pem);
+    // Far-future timestamp: parseCert treats the cert as expired and drops it.
+    try addCertToBundle(a, &bundle, cert, 4_000_000_000);
+    try std.testing.expectEqual(@as(usize, 0), bundle.bytes.items.len);
+}
+
+test "addCertToBundle accepts a DER cert" {
+    const a = std.testing.allocator;
+    const der = try pemToDer(a, test_pem);
+    defer a.free(der);
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(a);
+    const cert = tls.Certificate.fromDer(der);
+// now_sec within the cert's validity window (2026-08-21 .. 2027-08-21).
+try addCertToBundle(a, &bundle, cert, 1_790_000_000);
+    try std.testing.expect(bundle.bytes.items.len > 0);
+}
+
+test "extra_root_certificates mode loads system roots plus custom cert" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var certs = [_]tls.Certificate{tls.Certificate.fromPem(test_pem)};
+    var client = Client.init(a, .{ .protocol = .http, .extra_root_certificates = &certs });
+    defer client.deinit();
+    var http = try client.newHttpClient(io.io());
+    defer http.deinit();
+    // Requires system root certs to be present (rescan); standard CI images have them.
+    try std.testing.expect(http.ca_bundle.bytes.items.len > 0);
 }
