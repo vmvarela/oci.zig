@@ -534,3 +534,54 @@ test "Tier 3 admin/misc against zot" {
         try std.testing.expectEqualSlices(u8, config_fixture, data.config orelse return error.TestUnexpectedResult);
     }
 }
+
+test "deleteManifest against zot" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const registry = try registryHost(a);
+    var c = client.Client.init(a, .{ .protocol = .http });
+    defer c.deinit();
+
+    const ts = std.Io.Timestamp.toSeconds(std.Io.Clock.real.now(io));
+    var prng = std.Random.DefaultPrng.init(@intCast(ts));
+
+    // Push a manifest under a unique tag, then delete it by tag.
+    const man_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wdel-{d}:del-{d}", .{ registry, ts, ts }));
+    const cfg_digest = try c.pushBlob(io, man_ref, .anonymous, config_fixture);
+    const layer = try a.alloc(u8, 64 * 1024);
+    prng.random().bytes(layer);
+    const layer_digest = try c.pushBlob(io, man_ref, .anonymous, layer);
+    const man_layers = try a.alloc(manifest.OciDescriptor, 1);
+    man_layers[0] = .{ .media_type = manifest.oci_layer, .digest = layer_digest, .size = layer.len };
+    const man = manifest.OciImageManifest{
+        .schema_version = 2,
+        .media_type = manifest.oci_manifest,
+        .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest, .size = config_fixture.len },
+        .layers = man_layers,
+    };
+    _ = try c.pushManifest(io, man_ref, .anonymous, &.{ .manifest = man });
+    try std.testing.expectEqualStrings(cfg_digest, (try c.pullManifest(io, man_ref, .anonymous)).manifest.manifest.config.?.digest);
+
+    // Delete by tag: succeeds, then the manifest is gone (404).
+    try c.deleteManifest(io, man_ref, .anonymous);
+    try std.testing.expectError(error.NotFound, c.pullManifest(io, man_ref, .anonymous));
+    // Deleting again is idempotent: 404, not a hard failure.
+    try std.testing.expectError(error.NotFound, c.deleteManifest(io, man_ref, .anonymous));
+
+    // Delete by digest: push a second manifest, resolve its digest, delete it.
+    const dig_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/wdel-{d}:dig-{d}", .{ registry, ts, ts }));
+    _ = try c.pushManifest(io, dig_ref, .anonymous, &.{ .manifest = man });
+    const digest = try c.fetchManifestDigest(io, dig_ref, .anonymous);
+    const by_digest = try reference.parse(try std.fmt.allocPrint(a, "{s}/wdel-{d}@{s}", .{ registry, ts, digest }));
+    try c.deleteManifest(io, by_digest, .anonymous);
+    try std.testing.expectError(error.NotFound, c.pullManifest(io, by_digest, .anonymous));
+}

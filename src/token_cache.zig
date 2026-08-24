@@ -12,12 +12,14 @@ const Allocator = std.mem.Allocator;
 pub const RegistryOperation = enum {
     pull,
     push,
+    delete,
 
     /// The OCI scope component for this operation ("pull", "push", ...).
     pub fn scopeString(self: RegistryOperation) []const u8 {
         return switch (self) {
             .pull => "pull",
             .push => "push",
+            .delete => "delete",
         };
     }
 };
@@ -133,6 +135,7 @@ test "decodeJwtExp garbage payload errors" {
 test "op scope strings" {
     try std.testing.expectEqualStrings("pull", RegistryOperation.pull.scopeString());
     try std.testing.expectEqualStrings("push", RegistryOperation.push.scopeString());
+    try std.testing.expectEqualStrings("delete", RegistryOperation.delete.scopeString());
 }
 
 test "token cache get/put round-trip" {

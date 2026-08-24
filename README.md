@@ -5,7 +5,7 @@ Specification](https://github.com/opencontainers/distribution-spec) v1.1 —
 the protocol used by Docker Hub, GHCR, ACR, ECR, and any OCI-conformant
 registry. Pull/push of manifests and blobs (full, streaming, partial-range
 pulls; monolithic and chunked-stream pushes), authentication, tag listing,
-cross-repo blob mount, and the referrers API.
+cross-repo blob mount, manifest deletion, and the referrers API.
 
 A from-scratch reimplementation of the design and API surface of
 [`oras-project/rust-oci-client`](https://github.com/oras-project/rust-oci-client)
@@ -17,6 +17,8 @@ See [SPEC.md](SPEC.md) for the full project specification.
 ## Status
 
 **v0.4** — Tier 1 read path, Tier 2 write path, Tier 3 (catalog, blobExists), referrers API with tag-schema fallback, platform resolvers. Zero external dependencies (dropped `ocispec`); dead public API removed (`validateDigest`, `digestHeaderValue`, `storeAuthIfNeeded`); TLS certificate support (custom root CAs via `extra_root_certificates` / `tls_certs_only`).
+
+**v0.5** — `Client.deleteManifest` (manifest deletion by tag/digest).
 
 ## Requirements
 
@@ -84,6 +86,9 @@ const repos = try client.catalog(io.io(), image, auth, 50, last_repo);
 
 // Blob existence check (HEAD). Returns false when absent, errors otherwise.
 const exists = try client.blobExists(io.io(), image, auth, digest);
+
+// Delete a manifest by tag or digest. 404 -> error.NotFound (nothing to delete).
+try client.deleteManifest(io.io(), image, auth);
 
 // Referrers API, filtered to a specific artifact type (exact match)
 const refs = try client.pullReferrers(io.io(), image, auth, "application/vnd.example.sbom.v1");
