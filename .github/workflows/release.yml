@@ -12,6 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check tag matches build.zig.zon version
+        run: |
+          zon_version=$(grep -oP '\.version = "\K[^"]+' build.zig.zon)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$zon_version" != "$tag" ]; then
+            echo "build.zig.zon version ($zon_version) != tag ($tag)" >&2
+            exit 1
+          fi
       - name: Publish GitHub Release
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
