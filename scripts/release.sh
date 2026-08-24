@@ -19,8 +19,9 @@ if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 branch=$(git branch --show-current)
-if [ "$branch" != "main" ]; then
-    echo "run from main, current branch: $branch" >&2
+default_branch=$(git symbolic-ref refs/remotes/origin/HEAD --short 2>/dev/null | sed 's|^origin/||')
+if [ "$branch" != "$default_branch" ]; then
+    echo "run from $default_branch, current branch: $branch" >&2
     exit 1
 fi
 
