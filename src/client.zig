@@ -656,6 +656,48 @@ pub const Client = struct {
         return self.pushManifest(io, image, creds, &wrapped);
     }
 
+    /// Deletes `image`'s manifest (by tag, digest, or "latest" fallback) via
+    /// `DELETE /v2/<name>/manifests/<reference>` (OCI Distribution Spec
+    /// "Deleting Manifests"/"Deleting tags"). Sends the manifest media-type
+    /// Accept header (some registries, e.g. Docker Hub, require it). Maps
+    /// 202 -> success, 404 -> error.NotFound (nothing to delete), 403 ->
+    /// error.Forbidden, 401 after the token retry -> error.Unauthorized, and
+    /// any other status (e.g. 405 when the registry disables deletion) to the
+    /// registry error envelope (error.UnexpectedStatus).
+    pub fn deleteManifest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth) !void {
+        const ref_part = try manifestRef(self.allocator, image);
+        defer self.allocator.free(ref_part);
+        const path = try std.fmt.allocPrint(self.allocator, "manifests/{s}", .{ref_part});
+        defer self.allocator.free(path);
+        const url = try buildUrl(self.allocator, self.config, image, path, null);
+        defer self.allocator.free(url);
+        const uri = try std.Uri.parse(url);
+        const accept = try acceptHeader(self.allocator, &manifest_accept_types);
+        defer self.allocator.free(accept);
+
+        var attempt = try self.writeRequest(io, image, creds, .delete, .DELETE, uri, &.{
+            .{ .name = "Accept", .value = accept },
+        }, &.{});
+        defer {
+            attempt.container.req.deinit();
+            attempt.container.client.deinit();
+            self.allocator.destroy(attempt.container);
+        }
+        const status = attempt.resp.head.status;
+        if (status != .accepted) {
+            const err_body = try readBody(self.allocator, &attempt.resp);
+            defer self.allocator.free(err_body);
+            if (status == .unauthorized) return error.Unauthorized;
+            if (status == .not_found) return error.NotFound;
+            if (status == .forbidden) return error.Forbidden;
+            mapErrorFromEnvelope(self.allocator, err_body) catch |err| return err;
+            unreachable;
+        }
+        // Drain the body so the connection is reusable.
+        const drained = try readBody(self.allocator, &attempt.resp);
+        defer self.allocator.free(drained);
+    }
+
     /// Pushes layers (each as a blob), then config, then the manifest
     /// (Oracle m5 ordering). When `manifest` is null, one is built from
     /// `config` + `layers` (config required in that case). Returns the
@@ -924,12 +966,13 @@ pub const Client = struct {
     /// Sends a write-path request with the 401 -> Bearer token retry
     /// (Oracle M1): first attempt uses `authorizationHeader` (cached token or
     /// caller creds); on 401, parses the Bearer challenge from the FAILED
-    /// response, fetches a token with scope "repository:{repo}:pull,push",
-    /// caches it under (registry, repo, .push), and retries once. Anonymous
+    /// response, fetches a token with the operation's scope
+    /// ("repository:{repo}:pull,push" for push, "pull,delete" for delete),
+    /// caches it under (registry, repo, op), and retries once. Anonymous
     /// creds never retry. The container (http client + req) outlives the
     /// function; the caller keeps `resp` alive, then calls req.deinit() +
     /// client.deinit() + destroy (see WriteHttp).
-    fn writeRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, extra_headers: []const std.http.Header, body: []u8) !WriteAttempt {
+    fn writeRequest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation, method: std.http.Method, uri: std.Uri, extra_headers: []const std.http.Header, body: []u8) !WriteAttempt {
         const container = try self.allocator.create(WriteHttp);
         var client_ready = false;
         errdefer {
@@ -941,7 +984,7 @@ pub const Client = struct {
 
         var attempts: usize = 0;
         while (attempts < 2) : (attempts += 1) {
-            const auth_value = try self.authorizationHeader(io, image, creds, .push);
+            const auth_value = try self.authorizationHeader(io, image, creds, op);
             defer if (auth_value) |v| self.allocator.free(v);
 
             container.req = try container.client.request(method, uri, .{
@@ -950,7 +993,11 @@ pub const Client = struct {
                 .extra_headers = extra_headers,
             });
             errdefer container.req.deinit();
-            try container.req.sendBodyComplete(body);
+            if (method.requestHasBody()) {
+                try container.req.sendBodyComplete(body);
+            } else {
+                try container.req.sendBodiless();
+            }
             var resp = try container.req.receiveHead(&container.redirect_buf);
             const status = resp.head.status;
 
@@ -971,12 +1018,12 @@ pub const Client = struct {
                 defer if (challenge_value) |v| self.allocator.free(v);
                 const challenge = try auth_mod.parseBearerChallenge(challenge_value orelse return error.Unauthorized);
                 defer challenge.deinit();
-                const scope = try std.fmt.allocPrint(self.allocator, "repository:{s}:pull,push", .{image.repository});
+                const scope = try std.fmt.allocPrint(self.allocator, "repository:{s}:{s}", .{ image.repository, writeScope(op) });
                 defer self.allocator.free(scope);
                 const token = try self.tokenFromChallenge(io, challenge, creds, scope);
                 if (token) |t| {
                     defer self.allocator.free(t);
-                    try self.token_cache.put(image.registry, image.repository, .push, t);
+                    try self.token_cache.put(image.registry, image.repository, op, t);
                 }
                 // Last statement before continue: req is deinit'd exactly once.
                 container.req.deinit();
@@ -992,7 +1039,7 @@ pub const Client = struct {
     /// mapErrorFromEnvelope). Always consumes the response body so the
     /// connection is reusable (Oracle m5).
     fn writeExpect(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, method: std.http.Method, uri: std.Uri, headers: []const std.http.Header, body: []u8, want: std.http.Status) !WriteResult {
-        var attempt = try self.writeRequest(io, image, creds, method, uri, headers, body);
+        var attempt = try self.writeRequest(io, image, creds, .push, method, uri, headers, body);
         defer {
             attempt.container.req.deinit();
             attempt.container.client.deinit();
@@ -1320,6 +1367,17 @@ fn manifestRef(allocator: Allocator, image: reference.Reference) ![]u8 {
     if (image.tag) |t| return allocator.dupe(u8, t);
     if (image.digest) |d| return allocator.dupe(u8, d);
     return allocator.dupe(u8, "latest");
+}
+
+/// The repository scope actions requested for a write-path operation. Push
+/// requests pull,push (mounts may need pull); delete requests pull,delete
+/// (oras-go parity for manifest deletion).
+fn writeScope(op: token_cache.RegistryOperation) []const u8 {
+    return switch (op) {
+        .pull => "pull",
+        .push => "pull,push",
+        .delete => "pull,delete",
+    };
 }
 
 /// Resolves a registry `Location` response header to an absolute URL.

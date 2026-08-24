@@ -156,6 +156,7 @@ Grouped into delivery tiers — see §12.
 **Tier 3 — admin/misc**
 - `Client.catalog(io, image, creds, n: ?usize, last: ?[]const u8) ![]const []const u8`
 - `Client.blobExists(io, image, creds, digest) !bool`
+- `Client.deleteManifest(io, image, creds) !void` (DELETE by tag/digest; 404 → `error.NotFound`)
 
 ## 9. Known risk areas — validate before committing to the full port
 
@@ -201,6 +202,9 @@ types arises, revisit `oci-spec-zig` as a normal dependency (`zig fetch
   `ocispec` dependency, remove dead public API (`validateDigest`,
   `digestHeaderValue`, `storeAuthIfNeeded`), internal shrink; TLS certificate
   support (custom root CAs via `extra_root_certificates` / `tls_certs_only`). (complete)
+- **v0.5** — `Client.deleteManifest` (manifest deletion by tag/digest, OCI
+  Distribution Spec "Deleting Manifests"/"Deleting tags"; bearer scope
+  `repository:<name>:pull,delete`). (in progress)
 - **Post-v1.0 candidate** — evaluate `std.Io.Evented` once non-experimental.
 
 ## 13. Open questions
