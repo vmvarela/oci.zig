@@ -68,7 +68,6 @@ pub const ClientConfig = struct {
     /// NOT supported. Zig's std.http.Client hardcodes hostname verification
     /// and has no hook to disable certificate verification. Workaround: use
     /// the `.http` protocol or a TLS-terminating reverse proxy.
-
     /// Effective scheme for `registry` (https unless excepted).
     pub fn scheme(self: ClientConfig, registry: []const u8) []const u8 {
         return switch (self.protocol) {
@@ -439,8 +438,13 @@ pub const Client = struct {
                 m.deinit();
                 return error.NotFound;
             };
+            const sub_digest = self.allocator.dupe(u8, digest_str) catch |err| {
+                m.deinit();
+                return err;
+            };
+            defer self.allocator.free(sub_digest);
             m.deinit();
-            const sub = reference.Reference{ .registry = image.registry, .repository = image.repository, .digest = digest_str };
+            const sub = reference.Reference{ .registry = image.registry, .repository = image.repository, .digest = sub_digest };
             m = try self.pullManifestImpl(io, sub, creds, accepted_media_types);
         }
         errdefer m.deinit();
@@ -1880,8 +1884,8 @@ test "addCertToBundle accepts a DER cert" {
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(a);
     const cert = tls.Certificate.fromDer(der);
-// now_sec within the cert's validity window (2026-08-21 .. 2027-08-21).
-try addCertToBundle(a, &bundle, cert, 1_790_000_000);
+    // now_sec within the cert's validity window (2026-08-21 .. 2027-08-21).
+    try addCertToBundle(a, &bundle, cert, 1_790_000_000);
     try std.testing.expect(bundle.bytes.items.len > 0);
 }
 
