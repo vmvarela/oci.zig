@@ -876,7 +876,7 @@ pub const Client = struct {
             // pre-signed URL). Follow a bounded redirect chain; drop the
             // Authorization header when the target host changes, since the
             // redirect URL carries its own credentials.
-            if (status.class() == .redirection and redirects < max_redirects) {
+            if (status.class() == .redirect and redirects < max_redirects) {
                 const location = resp.head.location orelse return error.UnexpectedStatus;
                 const new_uri = (try resolveRedirect(uri_mut, location, &aux)) orelse return error.UnexpectedStatus;
                 redirects += 1;
@@ -977,7 +977,7 @@ pub const Client = struct {
 
             // See getBody: follow redirects (GHCR blob GETs redirect to a
             // signed CDN URL), stripping Authorization cross-host.
-            if (status.class() == .redirection and redirects < max_redirects) {
+            if (status.class() == .redirect and redirects < max_redirects) {
                 const location = resp.head.location orelse return error.UnexpectedStatus;
                 const new_uri = (try resolveRedirect(uri_mut, location, &aux)) orelse return error.UnexpectedStatus;
                 redirects += 1;
