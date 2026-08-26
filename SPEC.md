@@ -1,9 +1,13 @@
 # oci.zig — Project Specification
 
-Status: **v0.4** — all three delivery tiers implemented, zero external
-dependencies, zot-based CI. v0.4 was a breaking cleanup pass on the 0.1.0
-lib: dropped the never-imported `ocispec` dependency and removed dead public
-API (`validateDigest`, `digestHeaderValue`, `storeAuthIfNeeded`).
+Status: **v0.6** — all three delivery tiers implemented plus manifest
+deletion, zero external dependencies, zot-based CI. v0.4 was a breaking
+cleanup pass on the 0.1.0 lib: dropped the never-imported `ocispec`
+dependency and removed dead public API (`validateDigest`,
+`digestHeaderValue`, `storeAuthIfNeeded`). v0.5 added `deleteManifest`.
+v0.6 fixed an unbounded arena leak on manifest pulls: `PulledManifest`,
+`ManifestAndConfig`, and `ImageData` now own their strings in an internal
+arena and must be released with `deinit` (breaking).
 
 ## 1. Overview
 
@@ -123,6 +127,7 @@ src/
   errors.zig                   // OciError set + registry JSON error envelope
   secrets.zig                   // RegistryAuth (anonymous/basic/bearer)
   token_cache.zig                 // RegistryToken, TokenCache, RegistryOperation
+  tls.zig                    // TLS certificate configuration (extra root CAs / certs-only)
 ```
 
 Zero external dependencies. `ocispec` was evaluated and dropped in v0.4
@@ -207,7 +212,12 @@ types arises, revisit `oci-spec-zig` as a normal dependency (`zig fetch
   support (custom root CAs via `extra_root_certificates` / `tls_certs_only`). (complete)
 - **v0.5** — `Client.deleteManifest` (manifest deletion by tag/digest, OCI
   Distribution Spec "Deleting Manifests"/"Deleting tags"; bearer scope
-  `repository:<name>:pull,delete`). (in progress)
+  `repository:<name>:pull,delete`). (complete)
+- **v0.6** — memory-lifecycle fix: `PulledManifest`, `ManifestAndConfig`,
+  and `ImageData` own their strings in an internal arena released via
+  `deinit`, fixing an unbounded arena leak on every manifest pull
+  (issue #4). Breaking: callers must call `deinit` on these results.
+  (complete)
 - **Post-v1.0 candidate** — evaluate `std.Io.Evented` once non-experimental.
 
 ## 13. Open questions
