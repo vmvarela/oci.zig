@@ -674,9 +674,10 @@ pub const Client = struct {
     /// "Deleting Manifests"/"Deleting tags"). Sends the manifest media-type
     /// Accept header (some registries, e.g. Docker Hub, require it). Maps
     /// 202 -> success, 404 -> error.NotFound (nothing to delete), 403 ->
-    /// error.Forbidden, 401 after the token retry -> error.Unauthorized, and
-    /// any other status (e.g. 405 when the registry disables deletion) to the
-    /// registry error envelope (error.UnexpectedStatus).
+    /// error.Forbidden, 401 after the token retry -> error.Unauthorized, 405
+    /// -> error.DeleteUnsupported (registry disables manifest deletion; GHCR
+    /// returns UNSUPPORTED for DELETE), and any other status to the registry
+    /// error envelope (error.UnexpectedStatus).
     pub fn deleteManifest(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth) !void {
         const ref_part = try manifestRef(self.allocator, image);
         defer self.allocator.free(ref_part);
@@ -703,6 +704,10 @@ pub const Client = struct {
             if (status == .unauthorized) return error.Unauthorized;
             if (status == .not_found) return error.NotFound;
             if (status == .forbidden) return error.Forbidden;
+            // Registries that disable manifest deletion (GHCR returns 405
+            // UNSUPPORTED) must be detectable by callers that implement a
+            // fallback. See https://github.com/vmvarela/oci.zig/issues/8.
+            if (status == .method_not_allowed) return error.DeleteUnsupported;
             mapErrorFromEnvelope(self.allocator, err_body) catch |err| return err;
             unreachable;
         }
