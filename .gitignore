@@ -8,3 +8,5 @@ zig-cache/
 
 # Zig package cache (local fetch extraction)
 zig-pkg/
+
+.envrc
