@@ -77,7 +77,8 @@ test "Tier 1 client against zot" {
     const canonical_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/testrepo:canonical", .{registry}));
 
     // --- pullManifest(v1): structure + deterministic config digest ---
-    const v1 = try c.pullManifest(io, v1_ref, .anonymous);
+    var v1 = try c.pullManifest(io, v1_ref, .anonymous);
+    defer v1.deinit();
     try std.testing.expectEqualStrings(manifest.oci_manifest, v1.manifest.mediaType().?);
     const v1man = v1.manifest.manifest;
     try std.testing.expectEqualStrings(config_digest, v1man.config.?.digest);
@@ -87,7 +88,8 @@ test "Tier 1 client against zot" {
     // zot's Docker-Content-Digest is over the exact bytes we pushed; our
     // canonical re-serialization of the parsed manifest must hash to the same
     // value. This proves canonical_json matches what a real registry hashed.
-    const canonical = try c.pullManifest(io, canonical_ref, .anonymous);
+    var canonical = try c.pullManifest(io, canonical_ref, .anonymous);
+    defer canonical.deinit();
     try std.testing.expectEqualStrings(manifest.oci_manifest, canonical.manifest.mediaType().?);
     const value = try manifestToValue(a, canonical.manifest.manifest);
     const re_digest = try canonical_json.digestString(a, value);
@@ -98,7 +100,8 @@ test "Tier 1 client against zot" {
     try std.testing.expectEqualStrings(canonical.digest, fetched);
 
     // --- pullManifestAndConfig(v1) ---
-    const mc = try c.pullManifestAndConfig(io, v1_ref, .anonymous);
+    var mc = try c.pullManifestAndConfig(io, v1_ref, .anonymous);
+    defer mc.deinit();
     try std.testing.expectEqualStrings(config_digest, mc.config_digest);
     try std.testing.expectEqualSlices(u8, config_fixture, mc.config);
 
@@ -157,12 +160,14 @@ test "Tier 1 client against zot" {
     try std.testing.expectEqual(@as(usize, 1), refs.len);
     try std.testing.expectEqualStrings("application/vnd.example.sbom.v1", refs[0].artifact_type.?);
     const referrer_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/testrepo@{s}", .{ registry, refs[0].digest }));
-    const referrer = try c.pullManifest(io, referrer_ref, .anonymous);
+    var referrer = try c.pullManifest(io, referrer_ref, .anonymous);
+    defer referrer.deinit();
     try std.testing.expectEqualStrings(canonical.digest, referrer.manifest.manifest.subject.?.digest);
 
     // --- pull(v1): config content + 1 layer descriptor ---
     const accepted = [_][]const u8{ manifest.oci_manifest, manifest.oci_index };
-    const data = try c.pull(io, v1_ref, .anonymous, &accepted);
+    var data = try c.pull(io, v1_ref, .anonymous, &accepted);
+    defer data.deinit();
     try std.testing.expectEqualSlices(u8, config_fixture, data.config.?);
     try std.testing.expectEqual(@as(usize, 1), data.layers.len);
 
@@ -180,6 +185,103 @@ test "Tier 1 client against zot" {
     // --- 404 path ---
     const missing_ref = try reference.parse(try std.fmt.allocPrint(a, "{s}/testrepo:nonexistent", .{registry}));
     try std.testing.expectError(error.NotFound, c.pullManifest(io, missing_ref, .anonymous));
+}
+
+// Pull results must release all their memory via `deinit`: the client runs
+// on a bare DebugAllocator (no arena), so any unfreed manifest/config
+// allocation makes `gpa.deinit()` report a leak.
+test "pull results free their arenas" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("pull leaked memory");
+    const alloc = gpa.allocator();
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const registry = try registryHost(alloc);
+    defer alloc.free(registry);
+    var c = client.Client.init(alloc, .{ .protocol = .http });
+    defer c.deinit();
+
+    const ref_str = try std.fmt.allocPrint(alloc, "{s}/testrepo:v1", .{registry});
+    defer alloc.free(ref_str);
+    const ref = try reference.parse(ref_str);
+    const accepted = [_][]const u8{ manifest.oci_manifest, manifest.oci_index };
+
+    var p = try c.pullManifest(io, ref, .anonymous);
+    defer p.deinit();
+    try std.testing.expectEqualStrings(config_digest, p.manifest.manifest.config.?.digest);
+
+    var mc = try c.pullManifestAndConfig(io, ref, .anonymous);
+    defer mc.deinit();
+    try std.testing.expectEqualSlices(u8, config_fixture, mc.config);
+
+    var data = try c.pull(io, ref, .anonymous, &accepted);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 1), data.layers.len);
+
+    // Index path: pull() must resolve an index to its platform manifest and
+    // free both documents. The resolver result aliases the index arena, so a
+    // pull() freeing the index before copying the resolved digest would be a
+    // use-after-free (regression test).
+    {
+        const ts = std.Io.Timestamp.toSeconds(std.Io.Clock.real.now(io));
+        var prng = std.Random.DefaultPrng.init(@intCast(ts));
+        // Manifest and index live under DIFFERENT tags: overwriting a tag
+        // removes the previous manifest from zot's content store, so a single
+        // tag holding both would 404 the resolved sub-manifest.
+        const man_ref_str = try std.fmt.allocPrint(alloc, "{s}/wleak-{d}:man-{d}", .{ registry, ts, ts });
+        defer alloc.free(man_ref_str);
+        const man_ref = try reference.parse(man_ref_str);
+        const idx_ref_str = try std.fmt.allocPrint(alloc, "{s}/wleak-{d}:idx-{d}", .{ registry, ts, ts });
+        defer alloc.free(idx_ref_str);
+        const idx_ref = try reference.parse(idx_ref_str);
+
+        const cfg_digest = try c.pushBlob(io, man_ref, .anonymous, config_fixture);
+        defer alloc.free(cfg_digest);
+        const layer = try alloc.alloc(u8, 64 * 1024);
+        defer alloc.free(layer);
+        prng.random().bytes(layer);
+        const layer_digest = try c.pushBlob(io, man_ref, .anonymous, layer);
+        defer alloc.free(layer_digest);
+
+        const man_layers = try alloc.alloc(manifest.OciDescriptor, 1);
+        defer alloc.free(man_layers);
+        man_layers[0] = .{ .media_type = manifest.oci_layer, .digest = layer_digest, .size = layer.len };
+        const man = manifest.OciImageManifest{
+            .schema_version = 2,
+            .media_type = manifest.oci_manifest,
+            .config = .{ .media_type = manifest.oci_config, .digest = cfg_digest, .size = config_fixture.len },
+            .layers = man_layers,
+        };
+        const pushed = try c.pushManifest(io, man_ref, .anonymous, &.{ .manifest = man });
+        defer alloc.free(pushed);
+        const digest = try c.fetchManifestDigest(io, man_ref, .anonymous);
+        defer alloc.free(digest);
+        // The canonical-JSON value tree has no deinit in 0.16; build it in a
+        // scratch arena so it cannot leak through the bare DebugAllocator.
+        var value_arena = std.heap.ArenaAllocator.init(alloc);
+        defer value_arena.deinit();
+        const body = try canonical_json.stringify(alloc, try manifestToValue(value_arena.allocator(), man));
+        defer alloc.free(body);
+
+        const idx_manifests = try alloc.alloc(manifest.OciDescriptor, 1);
+        defer alloc.free(idx_manifests);
+        idx_manifests[0] = .{ .media_type = manifest.oci_manifest, .digest = digest, .size = body.len, .platform = .{ .architecture = "amd64", .os = "linux" } };
+        const index = manifest.OciImageIndex{
+            .schema_version = 2,
+            .media_type = manifest.oci_index,
+            .manifests = idx_manifests,
+        };
+        const idx_pushed = try c.pushManifestList(io, idx_ref, .anonymous, &index);
+        defer alloc.free(idx_pushed);
+
+        var data2 = try c.pull(io, idx_ref, .anonymous, &accepted);
+        defer data2.deinit();
+        try std.testing.expectEqualStrings(manifest.oci_manifest, data2.manifest.mediaType() orelse return error.TestUnexpectedResult);
+        try std.testing.expectEqual(@as(usize, 1), data2.layers.len);
+    }
 }
 
 test "Tier 2 write path against zot" {
@@ -265,7 +367,8 @@ test "Tier 2 write path against zot" {
     const local_digest = try canonical_json.digestString(a, local_value);
     try std.testing.expectEqualStrings(local_digest, dcd);
     try std.testing.expect(std.mem.endsWith(u8, pushed, dcd));
-    const back = try c.pullManifest(io, man_ref, .anonymous);
+    var back = try c.pullManifest(io, man_ref, .anonymous);
+    defer back.deinit();
     try std.testing.expectEqualStrings(cfg_digest, back.manifest.manifest.config.?.digest);
     try std.testing.expectEqualStrings(layer_digest, back.manifest.manifest.layers[0].digest);
 
@@ -287,7 +390,8 @@ test "Tier 2 write path against zot" {
         .manifests = idx_manifests,
     };
     const idx_pushed = try c.pushManifestList(io, idx_ref, .anonymous, &index);
-    const idx_back = try c.pullManifest(io, idx_ref, .anonymous);
+    var idx_back = try c.pullManifest(io, idx_ref, .anonymous);
+    defer idx_back.deinit();
     try std.testing.expect(idx_back.manifest.isIndex());
     try std.testing.expectEqualStrings(manifest.oci_index, idx_back.manifest.mediaType().?);
     try std.testing.expectEqualStrings(dcd, idx_back.manifest.index.manifests[0].digest);
@@ -303,7 +407,8 @@ test "Tier 2 write path against zot" {
         const res = try c.push(io, push_ref, .anonymous, null, config_fixture, &.{ lay_a, lay_b });
         const push_dcd = try c.fetchManifestDigest(io, push_ref, .anonymous);
         try std.testing.expect(std.mem.endsWith(u8, res.manifest_digest, push_dcd));
-        const mc = try c.pullManifestAndConfig(io, push_ref, .anonymous);
+        var mc = try c.pullManifestAndConfig(io, push_ref, .anonymous);
+        defer mc.deinit();
         try std.testing.expectEqualStrings(config_digest, mc.config_digest);
         try std.testing.expectEqualSlices(u8, config_fixture, mc.config);
         try std.testing.expectEqual(@as(usize, 2), mc.manifest.layers.len);
@@ -527,7 +632,8 @@ test "Tier 3 admin/misc against zot" {
 
         // Default resolver (linuxAmd64Resolver) must pick manifest A.
         const accepted = [_][]const u8{ manifest.oci_manifest, manifest.oci_index };
-        const data = try c.pull(io, idx_ref, .anonymous, &accepted);
+        var data = try c.pull(io, idx_ref, .anonymous, &accepted);
+        defer data.deinit();
         try std.testing.expectEqualStrings(manifest.oci_manifest, data.manifest.mediaType() orelse return error.TestUnexpectedResult);
         try std.testing.expectEqualStrings(cfg_digest_a, (data.manifest.manifest.config orelse return error.TestUnexpectedResult).digest);
         try std.testing.expectEqualStrings(lay_a_digest, data.manifest.manifest.layers[0].digest);
@@ -569,7 +675,9 @@ test "deleteManifest against zot" {
         .layers = man_layers,
     };
     _ = try c.pushManifest(io, man_ref, .anonymous, &.{ .manifest = man });
-    try std.testing.expectEqualStrings(cfg_digest, (try c.pullManifest(io, man_ref, .anonymous)).manifest.manifest.config.?.digest);
+    var pulled = try c.pullManifest(io, man_ref, .anonymous);
+    defer pulled.deinit();
+    try std.testing.expectEqualStrings(cfg_digest, pulled.manifest.manifest.config.?.digest);
 
     // Delete by tag: succeeds, then the manifest is gone (404).
     try c.deleteManifest(io, man_ref, .anonymous);

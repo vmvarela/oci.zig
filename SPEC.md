@@ -138,12 +138,15 @@ Grouped into delivery tiers — see §12.
 - `Client.auth(io, image: Reference, creds: RegistryAuth, op: RegistryOperation) !?[]const u8`
 - `Client.listTags(io, image, creds, n: ?usize, last: ?[]const u8) ![]const []const u8`
 - `Client.fetchManifestDigest(io, image, creds) ![]const u8`
-- `Client.pullManifest(io, image, creds) !struct { manifest: OciManifest, digest: []const u8 }`
-- `Client.pullManifestAndConfig(io, image, creds) !struct { manifest: OciImageManifest, config_digest: []const u8, config: []const u8 }`
+- `Client.pullManifest(io, image, creds) !PulledManifest` (has `deinit`)
+- `Client.pullManifestAndConfig(io, image, creds) !ManifestAndConfig` (has `deinit`)
 - `Client.pullBlob(io, image, digest, writer) !void`
 - `Client.pullBlobStream(io, image, digest) !BlobStreamResult` (stream + owning Request + container; `result.deinit()` after reads)
 - `Client.pullBlobStreamPartial(io, image, digest, offset, length) !BlobResponseResult` (partial — no digest verification)
-- `Client.pull(io, image, creds, accepted_media_types) !ImageData` (convenience wrapper)
+- `Client.pull(io, image, creds, accepted_media_types) !ImageData` (convenience wrapper; has `deinit`)
+
+`PulledManifest`, `ManifestAndConfig`, and `ImageData` each own their result
+strings in an internal arena; results must be released with `deinit`.
 - `Client.pullReferrers(io, image, creds, artifact_type) ![]OciDescriptor` (404 → tag-schema fallback)
 - Platform resolvers: `linuxAmd64Resolver`, `windowsAmd64Resolver`, `currentPlatformResolver`
 

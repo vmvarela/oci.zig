@@ -44,9 +44,10 @@ pub fn main() !void {
     const image = try oci.reference.parse("registry.example.com/team/app:v1");
     const auth = oci.secrets.RegistryAuth.anonymous;
 
-    const result = try client.pullManifest(io.io(), image, auth);
-    defer gpa.allocator().free(result.digest);
+    var result = try client.pullManifest(io.io(), image, auth);
+    defer result.deinit();
     // result.manifest: oci.manifest.OciManifest
+    // result.digest: []const u8 (owned by result; freed by deinit)
 }
 ```
 
