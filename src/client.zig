@@ -37,6 +37,31 @@ const tls = @import("tls.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
+/// Maximum redirect hops followed on GET requests (registries like GHCR
+/// redirect blob GETs to a pre-signed CDN URL).
+const max_redirects: u8 = 8;
+
+/// Resolve a redirect `location` against `uri` (RFC 3986 §5.2 via
+/// std.Uri.resolveInPlace). `aux` must outlive the returned Uri; on success
+/// it is advanced to the used region (std.http pattern). Null when the
+/// Location is missing or cannot be resolved.
+fn resolveRedirect(uri: std.Uri, location: []const u8, aux: *[]u8) !?std.Uri {
+    if (location.len == 0 or location.len > aux.*.len) return null;
+    const loc = aux.*[0..location.len];
+    @memcpy(loc, location);
+    return uri.resolveInPlace(location.len, aux) catch null;
+}
+
+/// True when both URIs share the same host (case-insensitive). Used to decide
+/// whether the Authorization header may be forwarded across a redirect.
+fn sameHost(a: std.Uri, b: std.Uri) bool {
+    var ab: [std.Io.net.HostName.max_len]u8 = undefined;
+    var bb: [std.Io.net.HostName.max_len]u8 = undefined;
+    const ah = a.getHost(&ab) catch return false;
+    const bh = b.getHost(&bb) catch return false;
+    return std.ascii.eqlIgnoreCase(ah.bytes, bh.bytes);
+}
+
 /// Transport scheme selection.
 pub const ClientProtocol = union(enum) {
     http,
@@ -820,13 +845,18 @@ pub const Client = struct {
         var http = try self.newHttpClient(io);
         defer http.deinit();
         var redirect_buf: [8192]u8 = undefined;
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        var uri_mut = uri;
+        var skip_auth = false;
+        var redirects: u8 = 0;
 
         var attempts: usize = 0;
         while (attempts < 2) : (attempts += 1) {
-            const auth_value = try self.authorizationHeader(io, image, creds, op);
+            const auth_value = if (skip_auth) null else try self.authorizationHeader(io, image, creds, op);
             defer if (auth_value) |v| self.allocator.free(v);
 
-            var req = try http.request(.GET, uri, .{
+            var req = try http.request(.GET, uri_mut, .{
                 .redirect_behavior = .unhandled,
                 .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
                 .extra_headers = headers,
@@ -839,6 +869,19 @@ pub const Client = struct {
             if (status == .unauthorized and attempts == 0) {
                 const token = try self.auth(io, image, creds, op);
                 if (token) |t| self.allocator.free(t);
+                continue;
+            }
+
+            // Registries may redirect GETs to a CDN (GHCR returns 307 with a
+            // pre-signed URL). Follow a bounded redirect chain; drop the
+            // Authorization header when the target host changes, since the
+            // redirect URL carries its own credentials.
+            if (status.class() == .redirection and redirects < max_redirects) {
+                const location = resp.head.location orelse return error.UnexpectedStatus;
+                const new_uri = (try resolveRedirect(uri_mut, location, &aux)) orelse return error.UnexpectedStatus;
+                redirects += 1;
+                skip_auth = !sameHost(uri_mut, new_uri);
+                uri_mut = new_uri;
                 continue;
             }
 
@@ -905,11 +948,16 @@ pub const Client = struct {
         }
 
         var attempts: usize = 0;
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        var uri_mut = uri;
+        var skip_auth = false;
+        var redirects: u8 = 0;
         while (attempts < 2) : (attempts += 1) {
-            const auth_value = try self.authorizationHeader(io, image, .anonymous, .pull);
+            const auth_value = if (skip_auth) null else try self.authorizationHeader(io, image, .anonymous, .pull);
             defer if (auth_value) |v| self.allocator.free(v);
 
-            container.req = try container.client.request(.GET, uri, .{
+            container.req = try container.client.request(.GET, uri_mut, .{
                 .redirect_behavior = .unhandled,
                 .headers = .{ .authorization = if (auth_value) |v| .{ .override = v } else .default },
                 .extra_headers = headers[0..headers_len],
@@ -923,6 +971,18 @@ pub const Client = struct {
                 const token = try self.auth(io, image, .anonymous, .pull);
                 if (token) |t| self.allocator.free(t);
                 // Last statement before continue: req is deinit'd exactly once.
+                container.req.deinit();
+                continue;
+            }
+
+            // See getBody: follow redirects (GHCR blob GETs redirect to a
+            // signed CDN URL), stripping Authorization cross-host.
+            if (status.class() == .redirection and redirects < max_redirects) {
+                const location = resp.head.location orelse return error.UnexpectedStatus;
+                const new_uri = (try resolveRedirect(uri_mut, location, &aux)) orelse return error.UnexpectedStatus;
+                redirects += 1;
+                skip_auth = !sameHost(uri_mut, new_uri);
+                uri_mut = new_uri;
                 container.req.deinit();
                 continue;
             }
@@ -1623,6 +1683,30 @@ test "linux and windows resolvers pick first matching platform" {
     };
     try std.testing.expectEqualStrings("sha256:amd", linuxAmd64Resolver(&descriptors).?);
     try std.testing.expectEqualStrings("sha256:win", windowsAmd64Resolver(&descriptors).?);
+}
+
+test "resolveRedirect follows relative and absolute locations" {
+    const base = try std.Uri.parse("https://ghcr.io/v2/owner/repo/blobs/sha256:abc");
+    var buf: [4096]u8 = undefined;
+    var aux: []u8 = &buf;
+    const rel = (try resolveRedirect(base, "/blobs/sha256:abc?se=1&sig=x", &aux)).?;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    var w = std.Io.Writer.Allocating.fromArrayList(std.testing.allocator, &out);
+    defer w.deinit();
+    try std.Uri.writeToStream(&rel, &w.writer, .{ .scheme = true, .authority = true, .path = true, .query = true });
+    try std.testing.expectEqualStrings("https://ghcr.io/blobs/sha256:abc?se=1&sig=x", w.written());
+
+    const abs = (try resolveRedirect(base, "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/x", &aux)).?;
+    try std.testing.expectEqualStrings("pkg-containers.githubusercontent.com", (try abs.getHostAlloc(std.testing.allocator)).bytes);
+}
+
+test "sameHost compares hosts case-insensitively" {
+    const a = try std.Uri.parse("https://ghcr.io/v2/x");
+    const b = try std.Uri.parse("https://GHCR.IO/v2/y");
+    const c = try std.Uri.parse("https://pkg-containers.githubusercontent.com/x");
+    try std.testing.expect(sameHost(a, b));
+    try std.testing.expect(!sameHost(a, c));
 }
 
 test "resolver returns null when no platform matches" {
