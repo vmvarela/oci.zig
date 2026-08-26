@@ -16,9 +16,10 @@
 //! 401 after the token flow -> `error.Unauthorized`.
 //!
 //! Ownership: every returned slice is allocated with the Client's allocator.
-//! `OciManifest` values have no `deinit` (their strings are allocated by
-//! `manifest.parse`); pass an arena allocator as the Client's allocator to
-//! reclaim them at a scope boundary.
+//! `PulledManifest`, `ManifestAndConfig`, and `ImageData` own their strings
+//! in an internal arena and must be released with `deinit`. Bare `OciManifest`
+//! values from `manifest.parse` have no `deinit`; pass an arena allocator as
+//! the Client's allocator to reclaim them at a scope boundary.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -90,11 +91,17 @@ pub const ClientConfig = struct {
 };
 
 /// Result of `pull`: the (possibly platform-resolved) manifest, the config
-/// blob content when present, and the layer descriptors.
+/// blob content when present, and the layer descriptors. All strings are
+/// owned by an internal arena; call `deinit` to release them.
 pub const ImageData = struct {
     manifest: manifest.OciManifest,
     config: ?[]const u8,
     layers: []manifest.OciDescriptor,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *ImageData) void {
+        self.arena.deinit();
+    }
 };
 
 /// The OCI client. Holds configuration, the allocator, and the bearer token
@@ -328,10 +335,11 @@ pub const Client = struct {
     }
 
     /// Pulls a single-platform manifest and its config blob. Errors when the
-    /// fetched document is an index.
-    pub fn pullManifestAndConfig(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth) !struct { manifest: manifest.OciImageManifest, config_digest: []const u8, config: []const u8 } {
-        const pulled = try self.pullManifest(io, image, creds);
-        defer self.allocator.free(pulled.digest);
+    /// fetched document is an index. Call `ManifestAndConfig.deinit` on the
+    /// result to release its strings.
+    pub fn pullManifestAndConfig(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth) !ManifestAndConfig {
+        var pulled = try self.pullManifest(io, image, creds);
+        errdefer pulled.deinit();
         switch (pulled.manifest) {
             .index => return error.OciError,
             .manifest => |man| {
@@ -339,8 +347,8 @@ pub const Client = struct {
                 var aw = std.Io.Writer.Allocating.init(self.allocator);
                 defer aw.deinit();
                 try self.pullBlob(io, image, config_desc.digest, &aw.writer);
-                const config = try self.allocator.dupe(u8, aw.written());
-                return .{ .manifest = man, .config_digest = config_desc.digest, .config = config };
+                const config = try pulled.arena.allocator().dupe(u8, aw.written());
+                return .{ .manifest = man, .config_digest = config_desc.digest, .config = config, .arena = pulled.arena };
             },
         }
     }
@@ -421,20 +429,21 @@ pub const Client = struct {
 
     /// Convenience pull: fetches the manifest (resolving an index to the
     /// configured platform), the config blob when present, and the layer
-    /// descriptors.
+    /// descriptors. Call `ImageData.deinit` on the result to release its
+    /// strings.
     pub fn pull(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, accepted_media_types: []const []const u8) !ImageData {
         var m = try self.pullManifestImpl(io, image, creds, accepted_media_types);
         if (m.manifest.isIndex()) {
             const resolver = self.config.platform_resolver orelse linuxAmd64Resolver;
             const digest_str = resolver(m.manifest.index.manifests) orelse {
-                self.allocator.free(m.digest);
+                m.deinit();
                 return error.NotFound;
             };
-            self.allocator.free(m.digest);
+            m.deinit();
             const sub = reference.Reference{ .registry = image.registry, .repository = image.repository, .digest = digest_str };
             m = try self.pullManifestImpl(io, sub, creds, accepted_media_types);
         }
-        defer self.allocator.free(m.digest);
+        errdefer m.deinit();
 
         var config: ?[]const u8 = null;
         var layers: []manifest.OciDescriptor = &.{};
@@ -444,13 +453,13 @@ pub const Client = struct {
                     var aw = std.Io.Writer.Allocating.init(self.allocator);
                     defer aw.deinit();
                     try self.pullBlob(io, image, c.digest, &aw.writer);
-                    config = try self.allocator.dupe(u8, aw.written());
+                    config = try m.arena.allocator().dupe(u8, aw.written());
                 }
                 layers = man.layers;
             },
             .index => unreachable,
         }
-        return .{ .manifest = m.manifest, .config = config, .layers = layers };
+        return .{ .manifest = m.manifest, .config = config, .layers = layers, .arena = m.arena };
     }
 
     /// Lists the referrers of `image`'s digest (OCI 1.1 referrers API),
@@ -773,13 +782,14 @@ pub const Client = struct {
         var result = try self.getBody(io, image, creds, .pull, uri, &.{.{ .name = "Accept", .value = accept }});
         defer result.deinit(self.allocator);
 
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
         const digest_str = if (result.digest_header) |d|
-            try self.allocator.dupe(u8, d)
+            try arena.allocator().dupe(u8, d)
         else
-            try sha256DigestString(self.allocator, result.body);
-        errdefer self.allocator.free(digest_str);
-        const m = try manifest.OciManifest.parse(self.allocator, result.body);
-        return .{ .manifest = m, .digest = digest_str };
+            try sha256DigestString(arena.allocator(), result.body);
+        const m = try manifest.OciManifest.parse(arena.allocator(), result.body);
+        return .{ .manifest = m, .digest = digest_str, .arena = arena };
     }
 
     /// Authorization header value for (image, op): the cached token if fresh,
@@ -1094,11 +1104,30 @@ pub const Client = struct {
     }
 };
 
-/// A pulled manifest plus its digest (both allocated with the Client's
-/// allocator).
+/// A pulled manifest plus its digest. The manifest strings and the digest
+/// are owned by an internal arena; call `deinit` to release them.
 pub const PulledManifest = struct {
     manifest: manifest.OciManifest,
     digest: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *PulledManifest) void {
+        self.arena.deinit();
+    }
+};
+
+/// Result of `pullManifestAndConfig`: the single-platform manifest, its
+/// config blob, and the config digest. All strings are owned by an internal
+/// arena; call `deinit` to release them.
+pub const ManifestAndConfig = struct {
+    manifest: manifest.OciImageManifest,
+    config_digest: []const u8,
+    config: []const u8,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *ManifestAndConfig) void {
+        self.arena.deinit();
+    }
 };
 
 /// Heap container keeping the http.Client and transfer buffers alive for the

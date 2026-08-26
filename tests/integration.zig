@@ -182,6 +182,41 @@ test "Tier 1 client against zot" {
     try std.testing.expectError(error.NotFound, c.pullManifest(io, missing_ref, .anonymous));
 }
 
+// Pull results must release all their memory via `deinit`: the client runs
+// on a bare DebugAllocator (no arena), so any unfreed manifest/config
+// allocation makes `gpa.deinit()` report a leak.
+test "pull results free their arenas" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("pull leaked memory");
+    const alloc = gpa.allocator();
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const registry = try registryHost(alloc);
+    defer alloc.free(registry);
+    var c = client.Client.init(alloc, .{ .protocol = .http });
+    defer c.deinit();
+
+    const ref_str = try std.fmt.allocPrint(alloc, "{s}/testrepo:v1", .{registry});
+    defer alloc.free(ref_str);
+    const ref = try reference.parse(ref_str);
+    const accepted = [_][]const u8{ manifest.oci_manifest, manifest.oci_index };
+
+    var p = try c.pullManifest(io, ref, .anonymous);
+    defer p.deinit();
+    try std.testing.expectEqualStrings(config_digest, p.manifest.manifest.config.?.digest);
+
+    var mc = try c.pullManifestAndConfig(io, ref, .anonymous);
+    defer mc.deinit();
+    try std.testing.expectEqualSlices(u8, config_fixture, mc.config);
+
+    var data = try c.pull(io, ref, .anonymous, &accepted);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, 1), data.layers.len);
+}
+
 test "Tier 2 write path against zot" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
