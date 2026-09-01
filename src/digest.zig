@@ -58,17 +58,6 @@ fn timingSafeEqlBytes(a: []const u8, b: []const u8) bool {
     return acc == 0;
 }
 
-/// Minimal `anytype` writer for `format` tests (std.Io has no fixed-buffer writer).
-pub const TestWriter = struct {
-    buf: []u8,
-    len: usize = 0,
-
-    pub fn print(self: *TestWriter, comptime fmt: []const u8, args: anytype) !void {
-        const s = try std.fmt.bufPrint(self.buf[self.len..], fmt, args);
-        self.len += s.len;
-    }
-};
-
 test "digestLength" {
     try std.testing.expectEqual(@as(usize, 32), digestLength(.sha256));
     try std.testing.expectEqual(@as(usize, 48), digestLength(.sha384));
@@ -79,9 +68,9 @@ test "digest parse and format round-trip" {
     const s = "sha256:3f57d9401f8d42f986df300f0c69192fc41da28ccc8d797829467780db3dd741";
     const d = try parse(s);
     var buf: [128]u8 = undefined;
-    var tw = TestWriter{ .buf = &buf };
-    try d.format(&tw);
-    try std.testing.expectEqualStrings(s, buf[0..tw.len]);
+    var w = std.Io.Writer.fixed(&buf);
+    try d.format(&w);
+    try std.testing.expectEqualStrings(s, w.buffered());
 
     const d2 = try parse("sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     try std.testing.expectEqual(@as(usize, 64), d2.len);

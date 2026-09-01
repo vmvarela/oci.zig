@@ -102,14 +102,10 @@ fn validateRepository(repository: []const u8) ParseError!void {
 fn validateTag(tag: []const u8) ParseError!void {
     // ^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$
     if (tag.len == 0 or tag.len > 128) return error.InvalidTag;
-    if (!(isAlnum(tag[0]) or tag[0] == '_')) return error.InvalidTag;
+    if (!(std.ascii.isAlphanumeric(tag[0]) or tag[0] == '_')) return error.InvalidTag;
     for (tag[1..]) |c| {
-        if (!isAlnum(c) and c != '.' and c != '_' and c != '-') return error.InvalidTag;
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '-') return error.InvalidTag;
     }
-}
-
-fn isAlnum(c: u8) bool {
-    return std.ascii.isAlphanumeric(c);
 }
 
 fn isLowerAlnum(c: u8) bool {
@@ -190,11 +186,8 @@ test "format round-trips" {
     for (cases) |c| {
         const ref = try parse(c);
         var buf: [256]u8 = undefined;
-        var tw = TestWriter{ .buf = &buf };
-        try ref.format(&tw);
-        try std.testing.expectEqualStrings(c, buf[0..tw.len]);
+        var w = std.Io.Writer.fixed(&buf);
+        try ref.format(&w);
+        try std.testing.expectEqualStrings(c, w.buffered());
     }
 }
-
-/// Shared with digest.zig's format tests (canonical copy lives there).
-const TestWriter = digest.TestWriter;

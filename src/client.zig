@@ -235,8 +235,8 @@ pub const Client = struct {
             else => return error.UnexpectedStatus,
         }
 
-        const challenge = try auth_mod.parseBearerChallenge(challenge_value orelse return error.Unauthorized);
-        defer challenge.deinit();
+        const challenge = try auth_mod.parseBearerChallenge(self.allocator, challenge_value orelse return error.Unauthorized);
+        defer challenge.deinit(self.allocator);
 
         // Token request: GET realm?service=..&scope=.. with the caller's creds.
         const token = try self.tokenFromChallenge(io, challenge, creds, challenge.scope orelse "") orelse return null;
@@ -839,8 +839,8 @@ pub const Client = struct {
 
     /// GET with auth (cache -> caller auth -> 401 token flow + one retry).
     /// Maps 404 -> NotFound, 403 -> Forbidden, other non-2xx -> UnexpectedStatus.
-    /// Returns the body plus copied `Docker-Content-Digest` / `Content-Range`
-    /// headers (owned by the caller via `GetResult.deinit`).
+    /// Returns the body plus a copied `Docker-Content-Digest` header
+    /// (owned by the caller via `GetResult.deinit`).
     fn getBody(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, op: token_cache.RegistryOperation, uri: std.Uri, headers: []const std.http.Header) !GetResult {
         var http = try self.newHttpClient(io);
         defer http.deinit();
@@ -900,22 +900,10 @@ pub const Client = struct {
                 while (it.next()) |h| {
                     if (std.ascii.eqlIgnoreCase(h.name, "docker-content-digest")) {
                         result.digest_header = try self.allocator.dupe(u8, h.value);
-                    } else if (std.ascii.eqlIgnoreCase(h.name, "content-range")) {
-                        result.content_range = try self.allocator.dupe(u8, h.value);
                     }
                 }
             }
-            var transfer_buf: [8192]u8 = undefined;
-            var out = std.ArrayList(u8).empty;
-            defer out.deinit(self.allocator);
-            const reader = resp.reader(&transfer_buf);
-            var chunk: [4096]u8 = undefined;
-            while (true) {
-                const n = try reader.readSliceShort(&chunk);
-                if (n == 0) break;
-                try out.appendSlice(self.allocator, chunk[0..n]);
-            }
-            result.body = try out.toOwnedSlice(self.allocator);
+            result.body = try readBody(self.allocator, &resp);
             return result;
         }
         return error.Unauthorized;
@@ -1025,19 +1013,11 @@ pub const Client = struct {
         var resp = try req.receiveHead(&redirect_buf);
         if (resp.head.status != .ok) return error.Unauthorized;
 
-        var transfer_buf: [8192]u8 = undefined;
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.allocator);
-        const reader = resp.reader(&transfer_buf);
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = try reader.readSliceShort(&chunk);
-            if (n == 0) break;
-            try out.appendSlice(self.allocator, chunk[0..n]);
-        }
+        const body = try readBody(self.allocator, &resp);
+        defer self.allocator.free(body);
 
         const TokenResp = struct { token: ?[]const u8 = null, access_token: ?[]const u8 = null };
-        const parsed = try std.json.parseFromSliceLeaky(TokenResp, self.allocator, out.items, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSliceLeaky(TokenResp, self.allocator, body, .{ .ignore_unknown_fields = true });
         const token = parsed.token orelse parsed.access_token orelse return error.InvalidResponse;
         return try self.allocator.dupe(u8, token);
     }
@@ -1095,8 +1075,8 @@ pub const Client = struct {
                 // any error here returns through the errdefer path, which
                 // deinits the (still live) req exactly once.
                 defer if (challenge_value) |v| self.allocator.free(v);
-                const challenge = try auth_mod.parseBearerChallenge(challenge_value orelse return error.Unauthorized);
-                defer challenge.deinit();
+                const challenge = try auth_mod.parseBearerChallenge(self.allocator, challenge_value orelse return error.Unauthorized);
+                defer challenge.deinit(self.allocator);
                 const scope = try std.fmt.allocPrint(self.allocator, "repository:{s}:{s}", .{ image.repository, writeScope(op) });
                 defer self.allocator.free(scope);
                 const token = try self.tokenFromChallenge(io, challenge, creds, scope);
@@ -1299,12 +1279,10 @@ const GetResult = struct {
     status: std.http.Status,
     body: []u8 = &.{},
     digest_header: ?[]u8 = null,
-    content_range: ?[]u8 = null,
 
     fn deinit(self: *GetResult, allocator: Allocator) void {
         if (self.body.len > 0) allocator.free(self.body);
         if (self.digest_header) |d| allocator.free(d);
-        if (self.content_range) |c| allocator.free(c);
     }
 };
 
@@ -1400,23 +1378,16 @@ fn indexDescriptors(allocator: Allocator, body: []const u8) ![]manifest.OciDescr
 }
 
 /// Percent-encodes `s` for use in a URI query value (RFC 3986 unreserved set
-/// kept verbatim).
+/// kept verbatim). Delegates to std.Uri.Component.percentEncode (uppercase hex).
 fn percentEncode(allocator: Allocator, s: []const u8) ![]u8 {
-    const hex = "0123456789ABCDEF";
-    var out = try allocator.alloc(u8, s.len * 3);
-    var n: usize = 0;
-    for (s) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            out[n] = c;
-            n += 1;
-        } else {
-            out[n] = '%';
-            out[n + 1] = hex[c >> 4];
-            out[n + 2] = hex[c & 0x0f];
-            n += 3;
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    try std.Uri.Component.percentEncode(&aw.writer, s, struct {
+        fn unreserved(c: u8) bool {
+            return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
         }
-    }
-    return allocator.realloc(out, n);
+    }.unreserved);
+    return allocator.dupe(u8, aw.written());
 }
 
 /// "sha256:<hex>" of `bytes`.

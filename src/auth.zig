@@ -10,17 +10,18 @@ const Allocator = std.mem.Allocator;
 /// A parsed Bearer challenge from a `WWW-Authenticate` header value.
 ///
 /// The slices are owned by the Challenge (allocated by `parseBearerChallenge`
-/// via `std.heap.page_allocator`) and must be released with `deinit`.
+/// from the provided allocator) and must be released with `deinit` using the
+/// same allocator.
 pub const Challenge = struct {
     realm: []const u8,
     service: ?[]const u8 = null,
     scope: ?[]const u8 = null,
 
     /// Frees the parameter storage allocated by `parseBearerChallenge`.
-    pub fn deinit(self: Challenge) void {
-        if (self.service) |s| std.heap.page_allocator.free(s);
-        if (self.scope) |s| std.heap.page_allocator.free(s);
-        std.heap.page_allocator.free(self.realm);
+    pub fn deinit(self: Challenge, allocator: Allocator) void {
+        if (self.service) |s| allocator.free(s);
+        if (self.scope) |s| allocator.free(s);
+        allocator.free(self.realm);
     }
 };
 
@@ -29,14 +30,14 @@ pub const Challenge = struct {
 /// (`\"` and `\\` escapes). Unknown params are skipped; `realm` is required.
 /// Values are unescaped into freshly allocated storage owned by the returned
 /// `Challenge` (see `Challenge.deinit`).
-pub fn parseBearerChallenge(header_value: []const u8) !Challenge {
+pub fn parseBearerChallenge(allocator: Allocator, header_value: []const u8) !Challenge {
     const trimmed = std.mem.trim(u8, header_value, " \t\r\n");
     const space = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
     const scheme = trimmed[0..space];
     if (!std.ascii.eqlIgnoreCase(scheme, "Bearer")) return error.InvalidHeader;
 
     var ch = Challenge{ .realm = "" };
-    errdefer ch.deinit();
+    errdefer ch.deinit(allocator);
 
     const params = trimmed[space..];
     var i: usize = 0;
@@ -69,21 +70,21 @@ pub fn parseBearerChallenge(header_value: []const u8) !Challenge {
             }
         }
         if (!closed) return error.InvalidHeader;
-        const value = try unescape(params[i + 1 .. j]);
+        const value = try unescape(allocator, params[i + 1 .. j]);
 
         if (std.ascii.eqlIgnoreCase(key, "realm")) {
             if (realm_set) {
-                std.heap.page_allocator.free(value);
+                allocator.free(value);
             } else {
                 ch.realm = value;
                 realm_set = true;
             }
         } else if (std.ascii.eqlIgnoreCase(key, "service")) {
-            if (ch.service != null) std.heap.page_allocator.free(value) else ch.service = value;
+            if (ch.service != null) allocator.free(value) else ch.service = value;
         } else if (std.ascii.eqlIgnoreCase(key, "scope")) {
-            if (ch.scope != null) std.heap.page_allocator.free(value) else ch.scope = value;
+            if (ch.scope != null) allocator.free(value) else ch.scope = value;
         } else {
-            std.heap.page_allocator.free(value); // unknown param: tolerate and skip
+            allocator.free(value); // unknown param: tolerate and skip
         }
         i = j + 1;
     }
@@ -93,11 +94,11 @@ pub fn parseBearerChallenge(header_value: []const u8) !Challenge {
 }
 
 /// Decodes a quoted-string body: `\"` -> `"`, `\\` -> `\`; other backslash
-/// sequences are kept verbatim (lenient). Allocates via page_allocator.
-fn unescape(raw: []const u8) ![]const u8 {
+/// sequences are kept verbatim (lenient). Allocates via `allocator`.
+fn unescape(allocator: Allocator, raw: []const u8) ![]const u8 {
     // Worst case (no escapes) needs raw.len bytes.
-    const buf = try std.heap.page_allocator.alloc(u8, raw.len);
-    errdefer std.heap.page_allocator.free(buf);
+    const buf = try allocator.alloc(u8, raw.len);
+    errdefer allocator.free(buf);
     var n: usize = 0;
     var i: usize = 0;
     while (i < raw.len) : (i += 1) {
@@ -118,14 +119,16 @@ fn unescape(raw: []const u8) ![]const u8 {
             n += 1;
         }
     }
-    return std.heap.page_allocator.realloc(buf, n);
+    return allocator.realloc(buf, n);
 }
 
 test "full header with all three params" {
+    const a = std.testing.allocator;
     const ch = try parseBearerChallenge(
+        a,
         "Bearer realm=\"https://registry.example.com\",service=\"registry.example.com\",scope=\"repository:foo:pull,push\"",
     );
-    defer ch.deinit();
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("https://registry.example.com", ch.realm);
     try std.testing.expectEqualStrings("registry.example.com", ch.service.?);
     // Comma inside the quoted scope must not split the param.
@@ -133,57 +136,63 @@ test "full header with all three params" {
 }
 
 test "realm only" {
-    const ch = try parseBearerChallenge("Bearer realm=\"https://x\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "Bearer realm=\"https://x\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("https://x", ch.realm);
     try std.testing.expectEqual(null, ch.service);
     try std.testing.expectEqual(null, ch.scope);
 }
 
 test "lowercase scheme accepted" {
-    const ch = try parseBearerChallenge("bearer realm=\"https://x\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "bearer realm=\"https://x\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("https://x", ch.realm);
 }
 
 test "unknown extra param skipped" {
-    const ch = try parseBearerChallenge("Bearer realm=\"r\",foo=\"bar\",service=\"s\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "Bearer realm=\"r\",foo=\"bar\",service=\"s\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("r", ch.realm);
     try std.testing.expectEqualStrings("s", ch.service.?);
 }
 
 test "param keys case-insensitive" {
-    const ch = try parseBearerChallenge("Bearer REALM=\"r\",Service=\"s\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "Bearer REALM=\"r\",Service=\"s\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("r", ch.realm);
     try std.testing.expectEqualStrings("s", ch.service.?);
 }
 
 test "unquoted value rejected" {
-    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge("Bearer realm=foo"));
+    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge(std.testing.allocator, "Bearer realm=foo"));
 }
 
 test "missing realm rejected" {
-    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge("Bearer service=\"s\""));
+    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge(std.testing.allocator, "Bearer service=\"s\""));
 }
 
 test "non-Bearer scheme rejected" {
-    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge("Basic realm=\"https://x\""));
+    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge(std.testing.allocator, "Basic realm=\"https://x\""));
 }
 
 test "unterminated quoted string rejected" {
-    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge("Bearer realm=\"oops"));
+    try std.testing.expectError(error.InvalidHeader, parseBearerChallenge(std.testing.allocator, "Bearer realm=\"oops"));
 }
 
 test "escaped quote inside realm" {
-    const ch = try parseBearerChallenge("Bearer realm=\"foo\\\"bar\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "Bearer realm=\"foo\\\"bar\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("foo\"bar", ch.realm);
 }
 
 test "escaped backslash inside realm" {
-    const ch = try parseBearerChallenge("Bearer realm=\"a\\\\b\"");
-    defer ch.deinit();
+    const a = std.testing.allocator;
+    const ch = try parseBearerChallenge(a, "Bearer realm=\"a\\\\b\"");
+    defer ch.deinit(a);
     try std.testing.expectEqualStrings("a\\b", ch.realm);
 }
