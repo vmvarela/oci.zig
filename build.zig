@@ -65,6 +65,23 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration-test", "Run integration tests against a running zot registry");
     integration_step.dependOn(&integration_run.step);
 
+    // Read-only smoke tests hit a real public registry (Docker Hub,
+    // anonymous) and are NOT part of the default `test` step. Run with
+    // `zig build smoke-test`.
+    const smoke_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    // std.c.getenv (used to read OCI_SMOKE_REF) needs libc.
+    smoke_test.root_module.link_libc = true;
+    smoke_test.root_module.addImport("oci", b.modules.get("root").?);
+    const smoke_run = b.addRunArtifact(smoke_test);
+    const smoke_step = b.step("smoke-test", "Run read-only smoke tests against Docker Hub (anonymous)");
+    smoke_step.dependOn(&smoke_run.step);
+
     // Compile-only check: depending on the Compile step (not a Run artifact)
     // forces full semantic analysis of every module plus the integration test
     // — including the write path, which unit tests never analyze (Zig lazy
