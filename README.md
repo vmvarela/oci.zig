@@ -1,5 +1,7 @@
 # oci.zig
 
+[![CI](https://github.com/vmvarela/oci.zig/actions/workflows/ci.yml/badge.svg)](https://github.com/vmvarela/oci.zig/actions/workflows/ci.yml)
+
 Pure-Zig client library for the [OCI Distribution
 Specification](https://github.com/opencontainers/distribution-spec) v1.1 —
 the protocol used by Docker Hub, GHCR, ACR, ECR, and any OCI-conformant
