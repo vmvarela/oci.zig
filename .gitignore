@@ -10,3 +10,4 @@ zig-cache/
 zig-pkg/
 
 .envrc
+.opencode/
