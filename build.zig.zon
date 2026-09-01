@@ -1,6 +1,6 @@
 .{
     .name = .oci,
-    .version = "0.6.0",
+    .version = "0.6.3",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xc674b4972f2f2429,
     .dependencies = .{},
