@@ -1,13 +1,17 @@
 # oci.zig — Project Specification
 
-Status: **v0.6** — all three delivery tiers implemented plus manifest
+Status: **v0.7** — all three delivery tiers implemented plus manifest
 deletion, zero external dependencies, zot-based CI. v0.4 was a breaking
 cleanup pass on the 0.1.0 lib: dropped the never-imported `ocispec`
 dependency and removed dead public API (`validateDigest`,
 `digestHeaderValue`, `storeAuthIfNeeded`). v0.5 added `deleteManifest`.
 v0.6 fixed an unbounded arena leak on manifest pulls: `PulledManifest`,
 `ManifestAndConfig`, and `ImageData` now own their strings in an internal
-arena and must be released with `deinit` (breaking).
+arena and must be released with `deinit` (breaking). v0.7 fixed the
+anonymous auth flow: bearer-token challenges are now honored for
+anonymous creds (credential-less token request, Docker Hub-style) and
+`pullBlob`/`pullBlobStream`/`pullBlobStreamPartial` take `creds`
+(breaking).
 
 ## 1. Overview
 
@@ -145,9 +149,9 @@ Grouped into delivery tiers — see §12.
 - `Client.fetchManifestDigest(io, image, creds) ![]const u8`
 - `Client.pullManifest(io, image, creds) !PulledManifest` (has `deinit`)
 - `Client.pullManifestAndConfig(io, image, creds) !ManifestAndConfig` (has `deinit`)
-- `Client.pullBlob(io, image, digest, writer) !void`
-- `Client.pullBlobStream(io, image, digest) !BlobStreamResult` (stream + owning Request + container; `result.deinit()` after reads)
-- `Client.pullBlobStreamPartial(io, image, digest, offset, length) !BlobResponseResult` (partial — no digest verification)
+- `Client.pullBlob(io, image, creds, digest, writer) !void`
+- `Client.pullBlobStream(io, image, creds, digest) !BlobStreamResult` (stream + owning Request + container; `result.deinit()` after reads)
+- `Client.pullBlobStreamPartial(io, image, creds, digest, offset, length) !BlobResponseResult` (partial — no digest verification)
 - `Client.pull(io, image, creds, accepted_media_types) !ImageData` (convenience wrapper; has `deinit`)
 
 `PulledManifest`, `ManifestAndConfig`, and `ImageData` each own their result

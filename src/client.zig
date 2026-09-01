@@ -370,7 +370,7 @@ pub const Client = struct {
                 const config_desc = man.config orelse return error.InvalidResponse;
                 var aw = std.Io.Writer.Allocating.init(self.allocator);
                 defer aw.deinit();
-                try self.pullBlob(io, image, config_desc.digest, &aw.writer);
+                try self.pullBlob(io, image, creds, config_desc.digest, &aw.writer);
                 const config = try pulled.arena.allocator().dupe(u8, aw.written());
                 return .{ .manifest = man, .config_digest = config_desc.digest, .config = config, .arena = pulled.arena };
             },
@@ -379,10 +379,12 @@ pub const Client = struct {
 
     /// Streams a full blob to `writer`, verifying its sha256 digest on
     /// completion. `writer` is a `std.Io.Writer` (by value or pointer) or any
-    /// type exposing `writeAll([]const u8) !void`. Auth via cached token; call
-    /// `pullManifest`/`auth` first on private registries.
-    pub fn pullBlob(self: *Client, io: Io, image: reference.Reference, digest_str: []const u8, writer: anytype) !void {
-        var open = try self.openBlob(io, image, digest_str, null);
+    /// type exposing `writeAll([]const u8) !void`.
+    ///
+    /// Authentication matches `getBody`: cached token first, then caller creds,
+    /// then one 401 -> token retry.
+    pub fn pullBlob(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, digest_str: []const u8, writer: anytype) !void {
+        var open = try self.openBlob(io, image, creds, digest_str, null);
         errdefer {
             open.req.deinit();
             open.container.client.deinit();
@@ -405,10 +407,12 @@ pub const Client = struct {
     }
 
     /// Opens a full blob for streaming. The consumer reads `stream` to EOF,
-    /// calls `stream.finish()`, then `result.deinit()`. Auth via cached token;
-    /// call `pullManifest`/`auth` first on private registries.
-    pub fn pullBlobStream(self: *Client, io: Io, image: reference.Reference, digest_str: []const u8) !BlobStreamResult {
-        var open = try self.openBlob(io, image, digest_str, null);
+    /// calls `stream.finish()`, then `result.deinit()`.
+    ///
+    /// Authentication matches `getBody`: cached token first, then caller creds,
+    /// then one 401 -> token retry.
+    pub fn pullBlobStream(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, digest_str: []const u8) !BlobStreamResult {
+        var open = try self.openBlob(io, image, creds, digest_str, null);
         var ok = false;
         defer if (!ok) {
             open.req.deinit();
@@ -427,9 +431,11 @@ pub const Client = struct {
     /// `length` the number of bytes (null = to end of blob). Expects a 206;
     /// the stream size is the full blob size from `Content-Range`. NO digest
     /// verification (upstream parity). The consumer reads `response` to EOF,
-    /// then `result.deinit()`. Auth via cached token; call `pullManifest`/`auth`
-    /// first on private registries.
-    pub fn pullBlobStreamPartial(self: *Client, io: Io, image: reference.Reference, digest_str: []const u8, offset: u64, length: ?u64) !BlobResponseResult {
+    /// then `result.deinit()`.
+    ///
+    /// Authentication matches `getBody`: cached token first, then caller creds,
+    /// then one 401 -> token retry.
+    pub fn pullBlobStreamPartial(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, digest_str: []const u8, offset: u64, length: ?u64) !BlobResponseResult {
         if (length != null and length.? == 0) return error.InvalidRange;
         const range = if (length) |len|
             try std.fmt.allocPrint(self.allocator, "bytes={d}-{d}", .{ offset, offset + len - 1 })
@@ -437,7 +443,7 @@ pub const Client = struct {
             try std.fmt.allocPrint(self.allocator, "bytes={d}-", .{offset});
         defer self.allocator.free(range);
 
-        var open = try self.openBlob(io, image, digest_str, range);
+        var open = try self.openBlob(io, image, creds, digest_str, range);
         var ok = false;
         defer if (!ok) {
             open.req.deinit();
@@ -481,7 +487,7 @@ pub const Client = struct {
                 if (man.config) |c| {
                     var aw = std.Io.Writer.Allocating.init(self.allocator);
                     defer aw.deinit();
-                    try self.pullBlob(io, image, c.digest, &aw.writer);
+                    try self.pullBlob(io, image, creds, c.digest, &aw.writer);
                     config = try m.arena.allocator().dupe(u8, aw.written());
                 }
                 layers = man.layers;
@@ -909,10 +915,12 @@ pub const Client = struct {
         return error.Unauthorized;
     }
 
-    /// Opens a blob GET (full or Range) with auth retry, returning the
-    /// received response. The `BlobHttp` container keeps the http.Client and
-    /// transfer buffers alive; `req` points into it at a stable address.
-    fn openBlob(self: *Client, io: Io, image: reference.Reference, digest_str: []const u8, range: ?[]const u8) !OpenBlob {
+    /// Opens a blob GET (full or Range) with auth retry (cache -> caller
+    /// creds -> one 401 token dance), returning the received response.
+    ///
+    /// The `BlobHttp` container keeps the http.Client and transfer buffers
+    /// alive; `req` points into it at a stable address.
+    fn openBlob(self: *Client, io: Io, image: reference.Reference, creds: secrets.RegistryAuth, digest_str: []const u8, range: ?[]const u8) !OpenBlob {
         const path = try std.fmt.allocPrint(self.allocator, "blobs/{s}", .{digest_str});
         defer self.allocator.free(path);
         const url = try buildUrl(self.allocator, self.config, image, path, null);
@@ -942,7 +950,7 @@ pub const Client = struct {
         var skip_auth = false;
         var redirects: u8 = 0;
         while (attempts < 2) : (attempts += 1) {
-            const auth_value = if (skip_auth) null else try self.authorizationHeader(io, image, .anonymous, .pull);
+            const auth_value = if (skip_auth) null else try self.authorizationHeader(io, image, creds, .pull);
             defer if (auth_value) |v| self.allocator.free(v);
 
             container.req = try container.client.request(.GET, uri_mut, .{
@@ -956,7 +964,7 @@ pub const Client = struct {
             const status = resp.head.status;
 
             if (status == .unauthorized and attempts == 0) {
-                const token = try self.auth(io, image, .anonymous, .pull);
+                const token = try self.auth(io, image, creds, .pull);
                 if (token) |t| self.allocator.free(t);
                 // Last statement before continue: req is deinit'd exactly once.
                 container.req.deinit();
@@ -988,12 +996,13 @@ pub const Client = struct {
     }
 
     /// Fetches a bearer token from the challenge's realm with `creds` and the
-    /// given `scope` (per-request, not the challenge's scope). Returns the
-    /// token (allocator-owned) or null when `creds` is anonymous. Caching of
+    /// given `scope` (per-request, not the challenge's scope).
+    ///
+    /// Anonymous creds perform a credential-less token request (Docker
+    /// Hub-style public pull). Returns the token (allocator-owned). Caching of
     /// the returned token is the caller's job (the registry/repo of the cache
     /// key live at the call site).
     fn tokenFromChallenge(self: *Client, io: Io, challenge: auth_mod.Challenge, creds: secrets.RegistryAuth, scope: []const u8) !?[]const u8 {
-        if (creds == .anonymous) return null;
         const token_url_str = try self.buildTokenUrlString(challenge, scope);
         defer self.allocator.free(token_url_str);
         const token_uri = try std.Uri.parse(token_url_str);
@@ -1750,15 +1759,99 @@ test "buildTokenUrlString uses the passed scope" {
     );
 }
 
-test "tokenFromChallenge returns null for anonymous" {
+const token_test_ctx = struct {
+    io: Io,
+    server: *std.Io.net.Server,
+    saw_authorization: *bool,
+    err: *?anyerror,
+};
+
+fn has_authorization_header(head_buffer: []const u8) bool {
+    const prefix = "authorization:";
+    var it = std.mem.splitSequence(u8, head_buffer, "\r\n");
+    _ = it.next(); // request line
+    while (it.next()) |line| {
+        if (line.len == 0) break;
+        if (line.len >= prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn serve_token_endpoint_once(ctx: *token_test_ctx) void {
+    serve_token_endpoint_once_impl(ctx) catch |err| {
+        ctx.err.* = err;
+    };
+}
+
+fn serve_token_endpoint_once_impl(ctx: *token_test_ctx) !void {
+    var stream = try ctx.server.accept(ctx.io);
+    defer stream.close(ctx.io);
+
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var in = stream.reader(ctx.io, &in_buf);
+    var out = stream.writer(ctx.io, &out_buf);
+    var server = std.http.Server.init(&in.interface, &out.interface);
+    var req = try server.receiveHead();
+
+    ctx.saw_authorization.* = has_authorization_header(req.head_buffer);
+    if (ctx.saw_authorization.*) {
+        try req.respond("{\"errors\":[{\"code\":\"UNAUTHORIZED\"}]}", .{
+            .status = .unauthorized,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        });
+        return;
+    }
+    try req.respond("{\"token\":\"anon-token\"}", .{
+        .status = .ok,
+        .keep_alive = false,
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+    });
+}
+
+test "tokenFromChallenge fetches anonymous token with no auth header" {
     const a = std.testing.allocator;
-    var io = std.Io.Threaded.init(a, .{});
-    defer io.deinit();
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var token_server = try std.Io.net.IpAddress.listen(&listen_addr, io, .{});
+
+    var saw_authorization = false;
+    var server_err: ?anyerror = null;
+    var ctx = token_test_ctx{
+        .io = io,
+        .server = &token_server,
+        .saw_authorization = &saw_authorization,
+        .err = &server_err,
+    };
+    var server_thread = try std.Thread.spawn(.{}, serve_token_endpoint_once, .{&ctx});
+    errdefer {
+        token_server.deinit(io);
+        server_thread.join();
+    }
+
     var client = Client.init(a, .{ .protocol = .http });
     defer client.deinit();
-    const ch = auth_mod.Challenge{ .realm = "http://127.0.0.1:5000/auth" };
-    // Anonymous short-circuits before any I/O.
-    try std.testing.expectEqual(@as(?[]const u8, null), try client.tokenFromChallenge(io.io(), ch, .anonymous, "repository:x:pull"));
+
+    const scope = "repository:library/alpine:pull";
+    const realm = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/token", .{token_server.socket.address.getPort()});
+    defer a.free(realm);
+    const ch = auth_mod.Challenge{ .realm = realm, .service = "registry.docker.io", .scope = scope };
+
+    const tok = try client.tokenFromChallenge(io, ch, .anonymous, scope);
+    defer if (tok) |t| a.free(t);
+    token_server.deinit(io);
+    server_thread.join();
+
+    if (server_err) |err| return err;
+    try std.testing.expect(!saw_authorization);
+    try std.testing.expect(tok != null);
+    try std.testing.expectEqualStrings("anon-token", tok.?);
 }
 
 test "locationToUrl relative and absolute" {
