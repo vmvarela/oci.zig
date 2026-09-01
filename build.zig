@@ -64,4 +64,11 @@ pub fn build(b: *std.Build) void {
     const integration_run = b.addRunArtifact(integration_test);
     const integration_step = b.step("integration-test", "Run integration tests against a running zot registry");
     integration_step.dependOn(&integration_run.step);
+
+    // Compile-only check: depending on the Compile step (not a Run artifact)
+    // forces full semantic analysis of every module plus the integration test
+    // — including the write path, which unit tests never analyze (Zig lazy
+    // analysis) — without needing a live registry. Run with `zig build check`.
+    const check_step = b.step("check", "Compile all modules and the integration test without running them");
+    check_step.dependOn(&integration_test.step);
 }
