@@ -22,6 +22,10 @@ See [SPEC.md](SPEC.md) for the full project specification.
 
 **v0.5** — `Client.deleteManifest` (manifest deletion by tag/digest).
 
+**v0.6** — `PulledManifest`, `ManifestAndConfig`, and `ImageData` own their result strings in an internal arena, released with `deinit` (breaking).
+
+**v0.7** — anonymous bearer-token dance fixed (credential-less token request on 401 challenge, Docker Hub-style); `pullBlob`, `pullBlobStream`, and `pullBlobStreamPartial` now take `creds` (breaking).
+
 ## Requirements
 
 - Zig 0.16.0 (pinned in `build.zig.zon`)

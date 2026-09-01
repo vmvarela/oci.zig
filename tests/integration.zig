@@ -108,7 +108,7 @@ test "Tier 1 client against zot" {
     // --- pullBlob(layer): written bytes hash to the layer digest ---
     var aw = std.Io.Writer.Allocating.init(a);
     defer aw.deinit();
-    try c.pullBlob(io, v1_ref, v1man.layers[0].digest, &aw.writer);
+    try c.pullBlob(io, v1_ref, .anonymous, v1man.layers[0].digest, &aw.writer);
     var h: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(aw.written(), &h, .{});
     const hex = std.fmt.bytesToHex(h, .lower);
@@ -116,7 +116,7 @@ test "Tier 1 client against zot" {
     try std.testing.expectEqualStrings(v1man.layers[0].digest, full);
 
     // --- pullBlobStream(layer): read to EOF + finish() passes ---
-    var bs = try c.pullBlobStream(io, v1_ref, v1man.layers[0].digest);
+    var bs = try c.pullBlobStream(io, v1_ref, .anonymous, v1man.layers[0].digest);
     defer bs.deinit();
     var buf: [32 * 1024]u8 = undefined;
     var total: usize = 0;
@@ -129,7 +129,7 @@ test "Tier 1 client against zot" {
     try bs.stream.finish();
 
     // --- pullBlobStreamPartial(layer, 0, 1024): 206, 1024 bytes, full size ---
-    var part = try c.pullBlobStreamPartial(io, v1_ref, v1man.layers[0].digest, 0, 1024);
+    var part = try c.pullBlobStreamPartial(io, v1_ref, .anonymous, v1man.layers[0].digest, 0, 1024);
     defer part.deinit();
     try std.testing.expect(part.response == .partial);
     const pstream = part.response.partial;
@@ -312,7 +312,7 @@ test "Tier 2 write path against zot" {
         const digest = try c.pushBlob(io, ref, .anonymous, data);
         var aw = std.Io.Writer.Allocating.init(a);
         defer aw.deinit();
-        try c.pullBlob(io, ref, digest, &aw.writer);
+        try c.pullBlob(io, ref, .anonymous, digest, &aw.writer);
         try std.testing.expectEqualSlices(u8, data, aw.written());
         var h: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data, &h, .{});
@@ -328,7 +328,7 @@ test "Tier 2 write path against zot" {
         const d5 = try c.pushBlobStream(io, ref, .anonymous, std.Io.Reader.fixed(data5), data5.len);
         var aw = std.Io.Writer.Allocating.init(a);
         defer aw.deinit();
-        try c.pullBlob(io, ref, d5, &aw.writer);
+        try c.pullBlob(io, ref, .anonymous, d5, &aw.writer);
         try std.testing.expectEqualSlices(u8, data5, aw.written());
 
         // Empty blob: no PATCHes, finalize only.
@@ -336,7 +336,7 @@ test "Tier 2 write path against zot" {
         try std.testing.expectEqualStrings("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", empty);
         var aw2 = std.Io.Writer.Allocating.init(a);
         defer aw2.deinit();
-        try c.pullBlob(io, ref, empty, &aw2.writer);
+        try c.pullBlob(io, ref, .anonymous, empty, &aw2.writer);
         try std.testing.expectEqual(@as(usize, 0), aw2.written().len);
     }
 
@@ -424,7 +424,7 @@ test "Tier 2 write path against zot" {
         try c.mountBlob(io, dst_ref, .anonymous, src_ref, digest);
         var aw = std.Io.Writer.Allocating.init(a);
         defer aw.deinit();
-        try c.pullBlob(io, dst_ref, digest, &aw.writer);
+        try c.pullBlob(io, dst_ref, .anonymous, digest, &aw.writer);
         try std.testing.expectEqualSlices(u8, data, aw.written());
     }
 
