@@ -39,7 +39,8 @@ pub const Digest = struct {
     /// Constant-time equality (algorithm + digest bytes).
     pub fn eql(a: Digest, b: Digest) bool {
         if (a.algorithm != b.algorithm or a.len != b.len) return false;
-        return timingSafeEqlBytes(a.value[0..a.len], b.value[0..b.len]);
+        // timing_safe.compare asserts equal lengths; the len check above guards it.
+        return std.crypto.timing_safe.compare(u8, a.value[0..a.len], b.value[0..b.len], .big) == .eq;
     }
 };
 
@@ -48,14 +49,6 @@ pub fn parse(s: []const u8) error{InvalidDigest}!Digest {
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return error.InvalidDigest;
     const algorithm = std.meta.stringToEnum(Algorithm, s[0..colon]) orelse return error.InvalidDigest;
     return Digest.init(algorithm, s[colon + 1 ..]);
-}
-
-/// Constant-time byte comparison for equal-length slices.
-fn timingSafeEqlBytes(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var acc: u8 = 0;
-    for (a, b) |x, y| acc |= x ^ y;
-    return acc == 0;
 }
 
 test "digestLength" {

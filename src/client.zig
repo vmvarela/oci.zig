@@ -398,7 +398,16 @@ pub const Client = struct {
         while (true) {
             const n = try bs.read(&buf);
             if (n == 0) break;
-            try writeAllTo(writer, buf[0..n]);
+            switch (@TypeOf(writer)) {
+                // ponytail: copying a Writer value is only safe when its state
+                // lives inline (e.g. fixed-buffer); Allocating writers must be
+                // passed by pointer.
+                std.Io.Writer => {
+                    var w = writer;
+                    try w.writeAll(buf[0..n]);
+                },
+                else => try writer.writeAll(buf[0..n]),
+            }
         }
         try bs.finish();
         open.req.deinit();
@@ -1332,24 +1341,14 @@ fn buildUrl(allocator: Allocator, config: ClientConfig, image: reference.Referen
 /// catalogUrl. Returns null when both `n` and `last` are absent; `last` is
 /// percent-encoded. The result is an owned allocation (free with `allocator`).
 fn buildPaginationQuery(allocator: Allocator, n: ?usize, last: ?[]const u8) !?[]const u8 {
-    var q = std.ArrayList(u8).empty;
-    defer q.deinit(allocator);
-    var first = true;
-    if (n) |count| {
-        const ns = try std.fmt.allocPrint(allocator, "n={d}", .{count});
-        defer allocator.free(ns);
-        try q.appendSlice(allocator, ns);
-        first = false;
-    }
+    if (n == null and last == null) return null;
     if (last) |l| {
-        if (!first) try q.append(allocator, '&');
-        try q.appendSlice(allocator, "last=");
         const enc = try percentEncode(allocator, l);
         defer allocator.free(enc);
-        try q.appendSlice(allocator, enc);
+        if (n) |count| return try std.fmt.allocPrint(allocator, "n={d}&last={s}", .{ count, enc });
+        return try std.fmt.allocPrint(allocator, "last={s}", .{enc});
     }
-    if (q.items.len == 0) return null;
-    return try allocator.dupe(u8, q.items);
+    return try std.fmt.allocPrint(allocator, "n={d}", .{n.?});
 }
 
 /// Builds "<scheme>://<registry>/v2/_catalog[?n=<n>[&last=<encoded>]]" —
@@ -1390,13 +1389,13 @@ fn indexDescriptors(allocator: Allocator, body: []const u8) ![]manifest.OciDescr
 /// kept verbatim). Delegates to std.Uri.Component.percentEncode (uppercase hex).
 fn percentEncode(allocator: Allocator, s: []const u8) ![]u8 {
     var aw = std.Io.Writer.Allocating.init(allocator);
-    defer aw.deinit();
+    errdefer aw.deinit();
     try std.Uri.Component.percentEncode(&aw.writer, s, struct {
         fn unreserved(c: u8) bool {
             return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
         }
     }.unreserved);
-    return allocator.dupe(u8, aw.written());
+    return aw.toOwnedSlice();
 }
 
 /// "sha256:<hex>" of `bytes`.
@@ -1521,22 +1520,6 @@ fn manifestCanonicalBytes(allocator: Allocator, m: *const manifest.OciManifest) 
 /// Current Unix time in seconds via the Io clock.
 fn nowUnixSeconds(io: Io) i64 {
     return std.Io.Timestamp.toSeconds(std.Io.Clock.real.now(io));
-}
-
-/// Writes `bytes` to a `std.Io.Writer` (by value or pointer) or any type with
-/// `writeAll([]const u8) !void`.
-fn writeAllTo(writer: anytype, bytes: []const u8) !void {
-    switch (@TypeOf(writer)) {
-        std.Io.Writer => {
-            // ponytail: copying a Writer value is only safe when its state
-            // lives inline (e.g. fixed-buffer); Allocating writers must be
-            // passed by pointer.
-            var w = writer;
-            try std.Io.Writer.writeAll(&w, bytes);
-        },
-        *std.Io.Writer => try writer.writeAll(bytes),
-        else => try writer.writeAll(bytes),
-    }
 }
 
 // ---- platform resolvers ----
@@ -1990,7 +1973,7 @@ test "applyTlsConfig accepts a valid PEM cert into the CA bundle" {
     const a = std.testing.allocator;
     var io = std.Io.Threaded.init(a, .{});
     defer io.deinit();
-    var certs = [_]tls.Certificate{tls.Certificate.fromPem(test_pem)};
+    var certs = [_]tls.Certificate{.{ .encoding = .pem, .data = test_pem }};
     var client = Client.init(a, .{ .protocol = .http, .tls_certs_only = &certs });
     defer client.deinit();
     var http = try client.newHttpClient(io.io());
@@ -2002,7 +1985,7 @@ test "applyTlsConfig rejects garbage PEM" {
     const a = std.testing.allocator;
     var io = std.Io.Threaded.init(a, .{});
     defer io.deinit();
-    var certs = [_]tls.Certificate{tls.Certificate.fromPem("not a certificate")};
+    var certs = [_]tls.Certificate{.{ .encoding = .pem, .data = "not a certificate" }};
     var client = Client.init(a, .{ .protocol = .http, .tls_certs_only = &certs });
     defer client.deinit();
     try std.testing.expectError(error.InvalidCertificate, client.newHttpClient(io.io()));
@@ -2024,7 +2007,7 @@ test "addCertToBundle drops an expired cert (bundle stays empty)" {
     const a = std.testing.allocator;
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(a);
-    const cert = tls.Certificate.fromPem(test_pem);
+    const cert = tls.Certificate{ .encoding = .pem, .data = test_pem };
     // Far-future timestamp: parseCert treats the cert as expired and drops it.
     try addCertToBundle(a, &bundle, cert, 4_000_000_000);
     try std.testing.expectEqual(@as(usize, 0), bundle.bytes.items.len);
@@ -2036,7 +2019,7 @@ test "addCertToBundle accepts a DER cert" {
     defer a.free(der);
     var bundle: std.crypto.Certificate.Bundle = .empty;
     defer bundle.deinit(a);
-    const cert = tls.Certificate.fromDer(der);
+    const cert = tls.Certificate{ .encoding = .der, .data = der };
     // now_sec within the cert's validity window (2026-08-21 .. 2027-08-21).
     try addCertToBundle(a, &bundle, cert, 1_790_000_000);
     try std.testing.expect(bundle.bytes.items.len > 0);
@@ -2046,7 +2029,7 @@ test "extra_root_certificates mode loads system roots plus custom cert" {
     const a = std.testing.allocator;
     var io = std.Io.Threaded.init(a, .{});
     defer io.deinit();
-    var certs = [_]tls.Certificate{tls.Certificate.fromPem(test_pem)};
+    var certs = [_]tls.Certificate{.{ .encoding = .pem, .data = test_pem }};
     var client = Client.init(a, .{ .protocol = .http, .extra_root_certificates = &certs });
     defer client.deinit();
     var http = try client.newHttpClient(io.io());

@@ -75,8 +75,9 @@ pub const TokenCache = struct {
     /// Returns the cached token if present and not expired
     /// (expiration absent or > now_secs); otherwise null.
     pub fn get(self: *TokenCache, registry: []const u8, repo: []const u8, op: RegistryOperation, now_secs: i64) ?RegistryToken {
-        var buf: [512]u8 = undefined;
-        const key_str = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ registry, repo, op.scopeString() }) catch return null;
+        const allocator = self.tokens.allocator;
+        const key_str = cacheKey(allocator, registry, repo, op) catch return null;
+        defer allocator.free(key_str);
         const token = self.tokens.get(key_str) orelse return null;
         if (token.expiration) |exp| {
             if (exp <= now_secs) return null; // expired
@@ -89,7 +90,7 @@ pub const TokenCache = struct {
     /// stored too; `get` drops them.
     pub fn put(self: *TokenCache, registry: []const u8, repo: []const u8, op: RegistryOperation, token: []const u8) !void {
         const allocator = self.tokens.allocator;
-        const key_str = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ registry, repo, op.scopeString() });
+        const key_str = try cacheKey(allocator, registry, repo, op);
         errdefer allocator.free(key_str);
         const token_owned = try allocator.dupe(u8, token);
         errdefer allocator.free(token_owned);
@@ -97,6 +98,11 @@ pub const TokenCache = struct {
         try self.tokens.put(key_str, .{ .token = token_owned, .expiration = expiration });
     }
 };
+
+/// Builds the composite cache key "registry/repo/op" (caller frees).
+fn cacheKey(allocator: Allocator, registry: []const u8, repo: []const u8, op: RegistryOperation) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ registry, repo, op.scopeString() });
+}
 
 /// Extracts the payload segment of a JWT ("header.payload.signature").
 /// Non-JWT tokens fall back to the whole string (decode will fail -> null exp).
