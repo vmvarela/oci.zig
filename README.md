@@ -107,8 +107,8 @@ Private registries with self-signed or private-CA certificates:
 
 ```zig
 // ca_pem_bytes: PEM bytes of the CA certificate (caller-owned).
-// .fromDer(der_bytes) also works for DER-encoded certificates.
-var ca_certs = [_]oci.tls.Certificate{oci.tls.Certificate.fromPem(ca_pem_bytes)};
+// Use .encoding = .der with DER bytes instead.
+var ca_certs = [_]oci.tls.Certificate{.{ .encoding = .pem, .data = ca_pem_bytes }};
 
 var client = oci.client.Client.init(gpa.allocator(), .{
     .protocol = .https,
