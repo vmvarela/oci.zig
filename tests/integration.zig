@@ -259,8 +259,8 @@ test "pull results free their arenas" {
         defer alloc.free(pushed);
         const digest = try c.fetchManifestDigest(io, man_ref, .anonymous);
         defer alloc.free(digest);
-        // The canonical-JSON value tree has no deinit in 0.16; build it in a
-        // scratch arena so it cannot leak through the bare DebugAllocator.
+        // The canonical-JSON value tree has no deinit; build it in a scratch
+        // arena so it cannot leak through the bare DebugAllocator.
         var value_arena = std.heap.ArenaAllocator.init(alloc);
         defer value_arena.deinit();
         const body = try canonical_json.stringify(alloc, try manifestToValue(value_arena.allocator(), man));

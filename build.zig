@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     for (modules) |m| {
-        // 0.16: addTest takes .root_module (no legacy .root_source_file).
+        // addTest takes .root_module rather than legacy .root_source_file.
         const test_mod = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(m.src),

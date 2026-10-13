@@ -1,5 +1,5 @@
 //! Tier 1 read-path OCI Distribution client (mirror of rust-oci-client
-//! v0.17.0 `client.rs`), built on Zig 0.16 std only.
+//! v0.17.0 `client.rs`), built on Zig 0.17 std only.
 //!
 //! Transport is `std.http.Client` (struct literal `.{ .allocator, .io }`),
 //! `std.Io` for I/O, `std.crypto.tls` for TLS. Public API is ocispec-free:
@@ -57,8 +57,8 @@ fn resolveRedirect(uri: std.Uri, location: []const u8, aux: *[]u8) !?std.Uri {
 fn sameHost(a: std.Uri, b: std.Uri) bool {
     var ab: [std.Io.net.HostName.max_len]u8 = undefined;
     var bb: [std.Io.net.HostName.max_len]u8 = undefined;
-    const ah = a.getHost(&ab) catch return false;
-    const bh = b.getHost(&bb) catch return false;
+    const ah = std.Io.net.HostName.fromUri(a, &ab) catch return false;
+    const bh = std.Io.net.HostName.fromUri(b, &bb) catch return false;
     return std.ascii.eqlIgnoreCase(ah.bytes, bh.bytes);
 }
 
@@ -1661,7 +1661,9 @@ test "resolveRedirect follows relative and absolute locations" {
     try std.testing.expectEqualStrings("https://ghcr.io/blobs/sha256:abc?se=1&sig=x", w.written());
 
     const abs = (try resolveRedirect(base, "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/x", &aux)).?;
-    try std.testing.expectEqualStrings("pkg-containers.githubusercontent.com", (try abs.getHostAlloc(std.testing.allocator)).bytes);
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try std.Io.net.HostName.fromUri(abs, &host_buf);
+    try std.testing.expectEqualStrings("pkg-containers.githubusercontent.com", host.bytes);
 }
 
 test "sameHost compares hosts case-insensitively" {

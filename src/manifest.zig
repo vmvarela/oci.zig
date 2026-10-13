@@ -9,8 +9,8 @@
 //! digests.
 //!
 //! JSON wire names are camelCase (mediaType, schemaVersion, ...) per the OCI
-//! spec; Zig fields are snake_case. std.json 0.16 matches JSON keys to Zig
-//! field names verbatim (no auto-rename), so parsing goes through private
+//! spec; Zig fields are snake_case. std.json matches JSON keys to Zig field
+//! names verbatim (no auto-rename), so parsing goes through private
 //! camelCase "wire" mirror structs that std.json handles natively, and the
 //! public snake_case structs convert to/from them. Public structs serialize
 //! via `jsonStringify`; JSON documents are parsed with `OciManifest.parse`.

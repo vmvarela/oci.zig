@@ -57,8 +57,8 @@ pub const OciErrorCode = enum {
     /// Matches a registry error code string (e.g. "BLOB_UNKNOWN") against the
     /// canonical codes, case-insensitively. Returns null for unknown strings.
     pub fn fromString(s: []const u8) ?OciErrorCode {
-        inline for (@typeInfo(OciErrorCode).@"enum".fields) |f| {
-            if (std.ascii.eqlIgnoreCase(f.name, s)) return @enumFromInt(f.value);
+        inline for (@typeInfo(OciErrorCode).@"enum".field_names) |name| {
+            if (std.ascii.eqlIgnoreCase(name, s)) return @field(OciErrorCode, name);
         }
         return null;
     }

@@ -103,12 +103,11 @@ crate, std-only. The table records the original plan and the final call.
 
 ## 6. Target environment
 
-- Zig **0.16.0** (stable, released 2026-04-14) as the minimum and the
-  pinned CI version.
+- Zig **0.17.0** as the minimum and the pinned CI version.
 - Track tagged releases, not `master`/`-dev` builds, on the main branch.
-  `std.Io` is one release old; expect further churn toward 0.17
-  (`std.Io.Evented` maturing, possible API adjustments). Re-evaluate the
-  pin once 0.17 stabilizes.
+  `std.Io` and related networking APIs remain an active part of Zig's
+  evolving standard library; re-evaluate compatibility on future tagged
+  releases.
 - Platforms: Zig Tier 1 targets (Linux, macOS, Windows). No platform-specific
   code expected beyond what `std.http.Client` / `std.crypto.tls` already
   abstract.
@@ -182,9 +181,10 @@ strings in an internal arena; results must be released with `deinit`.
    manifest digest — the registry either rejects the push or, worse, accepts
    a mismatched one. Build a golden-vector test suite sourced from
    `rust-oci-client`'s own test fixtures, not just hand-written examples.
-3. **Zig 0.16 → 0.17 churn.** `std.Io` is one release old. Pin the required
-   version in `build.zig.zon` and budget maintenance time for the next
-   release cycle.
+3. **Zig standard-library churn.** The project is pinned to Zig 0.17.0.
+   Future tagged releases may still require small `std.Io`, HTTP, URI, or
+   build-system migrations; keep the required version explicit in
+   `build.zig.zon`.
 
 ## 10. Testing strategy
 
