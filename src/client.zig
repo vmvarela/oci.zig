@@ -1661,7 +1661,9 @@ test "resolveRedirect follows relative and absolute locations" {
     try std.testing.expectEqualStrings("https://ghcr.io/blobs/sha256:abc?se=1&sig=x", w.written());
 
     const abs = (try resolveRedirect(base, "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/x", &aux)).?;
-    try std.testing.expectEqualStrings("pkg-containers.githubusercontent.com", (try abs.getHostAlloc(std.testing.allocator)).bytes);
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try std.Io.net.HostName.fromUri(abs, &host_buf);
+    try std.testing.expectEqualStrings("pkg-containers.githubusercontent.com", host.bytes);
 }
 
 test "sameHost compares hosts case-insensitively" {
