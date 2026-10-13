@@ -28,7 +28,7 @@ See [SPEC.md](SPEC.md) for the full project specification.
 
 ## Requirements
 
-- Zig 0.16.0 (pinned in `build.zig.zon`)
+- Zig 0.17.0 (pinned in `build.zig.zon`)
 - No external dependencies (Zig std only)
 
 ## Usage

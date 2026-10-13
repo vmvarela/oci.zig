@@ -72,9 +72,8 @@ fn writeValueInner(w: *std.Io.Writer, allocator: Allocator, value: std.json.Valu
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .integer => |i| try w.print("{d}", .{i}),
         // ponytail: {d} routes floats through std.fmt.printFloat (ryu,
-        // shortest round-trip: 1.5 -> "1.5", 0.0 -> "0"). The {f} specifier
-        // is broken in Zig 0.16 (calls a nonexistent value.format); upgrade
-        // when std fixes it. Manifests rarely carry floats.
+        // shortest round-trip: 1.5 -> "1.5", 0.0 -> "0"). Keep the compact
+        // round-trippable representation here; manifests rarely carry floats.
         .float => |f| try w.print("{d}", .{f}),
         .number_string => |s| try w.writeAll(s),
         .string => |s| try writeString(w, s),
