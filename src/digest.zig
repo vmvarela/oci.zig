@@ -25,7 +25,7 @@ pub const Digest = struct {
     pub fn init(algorithm: Algorithm, hex_value: []const u8) error{InvalidDigest}!Digest {
         const want = digestLength(algorithm);
         if (hex_value.len != want * 2) return error.InvalidDigest;
-        var value = [_]u8{0} ** 64;
+        var value: [64]u8 = @splat(0);
         _ = std.fmt.hexToBytes(value[0..want], hex_value) catch return error.InvalidDigest;
         return .{ .algorithm = algorithm, .value = value, .len = want };
     }
