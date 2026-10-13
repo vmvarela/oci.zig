@@ -124,7 +124,8 @@ var client = oci.client.Client.init(gpa.allocator(), .{
 ## Development
 
 ```sh
-zig build test          # unit tests (no network)
+zig build  # compile the library
+zig build test  # unit tests (no network)
 zig build integration-test  # integration tests against a local zot registry
 ```
 
